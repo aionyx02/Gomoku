@@ -2,11 +2,11 @@
  * @file main.h
  * @author shawn
  * @date 2026/3/19
- * @brief 
+ * @brief the file is to set the base struct about gomoku
  *
  * * Under the hood:
- * - Memory Layout: 
- * - System Calls / Interactions: 
+ * - Memory Layout:
+ * - System Calls / Interactions:
  * - Resource Impact: 
  */
 #ifndef GOMOKU_MAIN_H

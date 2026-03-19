@@ -2,7 +2,7 @@
  * @file app.cpp
  * @author shawn
  * @date 2026/3/19
- * @brief 
+ * @brief the file is to play the gomoku game
  *
  * * Under the hood:
  * - Memory Layout: 

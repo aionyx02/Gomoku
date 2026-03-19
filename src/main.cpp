@@ -2,7 +2,7 @@
  * @file main.cpp
  * @author shawn
  * @date 2026/3/19
- * @brief 
+ * @brief the file is to set the gomoku member function
  *
  * * Under the hood:
  * - Memory Layout: 
