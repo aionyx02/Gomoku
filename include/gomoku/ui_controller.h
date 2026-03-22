@@ -24,16 +24,20 @@ namespace UI {
     private:
         gomoku::Board& board;
         ftxui::ScreenInteractive screen = ftxui::ScreenInteractive::Fullscreen();
+        const std::vector<std::string> menu_entries = {"開始新遊戲", "結束遊戲",};
 
+        int menu_selected = 0;
         int active_index = 0;
         int current_x = 0;
         int current_y = 0;
+
+        gomoku::Stone current_player = gomoku::Stone::BLACK;
 
         ftxui::Component RenderFrontPage();
         ftxui::Component RenderGameBoard();
         ftxui::Component RenderEndPage();
 
-        ftxui::Element RenderGrid();
+        [[nodiscard]]ftxui::Element RenderGrid() const;
     };
 }
 #endif //GOMOKU_UI_CONTROLLER_H
