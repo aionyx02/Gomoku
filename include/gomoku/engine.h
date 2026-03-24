@@ -1,38 +1,44 @@
 /**
  * @file engine.h
- * @author shawn
+ * @author aionyx
  * @date 2026/3/19
- * @brief the file is to set the base struct about gomoku
- *
- * * Under the hood:
- * - Memory Layout:
- * - System Calls / Interactions:
- * - Resource Impact: 
+ * @brief Gomoku core engine declaration (self-contained state machine)
  */
-#ifndef GOMOKU_MAIN_H
-#define GOMOKU_MAIN_H
+#ifndef GOMOKU_ENGINE_H
+#define GOMOKU_ENGINE_H
 
-#include <vector>
 #include <cstdint>
+#include <vector>
 
 namespace gomoku {
     enum class Stone : uint8_t { EMPTY = 0, BLACK, WHITE };
+
+    enum class GameStatus : uint8_t {
+        PLAYING = 0,
+        BLACK_WIN,
+        WHITE_WIN,
+        DRAW
+    };
 
     class Board {
     private:
         int size_;
         std::vector<Stone> grid_;
+        Stone current_player_;
+        GameStatus status_;
+
+        [[nodiscard]] bool checkWinCondition(int lastX, int lastY) const;
+
     public:
         explicit Board(int s = 15);
-        bool placeStone(int x, int y, Stone s);
+
+        // Place a stone for the current player and auto-transition state.
+        bool placeStone(int x, int y);
+
         [[nodiscard]] Stone getStone(int x, int y) const;
+        [[nodiscard]] Stone getCurrentPlayer() const;
+        [[nodiscard]] GameStatus getStatus() const;
     };
-
-    class GameEngine {
-    public:
-        static bool checkWin(const Board& board, int lastX, int lastY);
-    };
-
 }
 
 #endif
