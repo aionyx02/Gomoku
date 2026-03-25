@@ -46,7 +46,7 @@ def train(
     iterations=30,
     replay_capacity=50000,
     num_self_play_games=4,
-    simulations=200,
+    simulations=400,
     batch_size=128,
     updates_per_iteration=10,
     min_buffer_size=256,
