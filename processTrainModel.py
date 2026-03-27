@@ -1,48 +1,28 @@
 import argparse
-import copy
-import io
+import random
 
+import numpy as np
 import torch
-import torch.nn as nn
 
-from model import ReplayBuffer, run_training_iteration
-
-
-class GomokuNet(nn.Module):
-    def __init__(self, board_size=15, hidden_dim=256):
-        super().__init__()
-        in_dim = 3 * board_size * board_size
-        out_dim = board_size * board_size
-        self.fc = nn.Linear(in_dim, hidden_dim)
-        self.policy_head = nn.Linear(hidden_dim, out_dim)  # policy logits
-        self.value_head = nn.Linear(hidden_dim, 1)  # value in [-1, 1]
-
-    def forward(self, x):
-        x = x.view(x.size(0), -1)
-        h = torch.relu(self.fc(x))
-        policy = self.policy_head(h)  # [B, board_size*board_size]
-        value = torch.tanh(self.value_head(h))  # [B, 1]
-        return policy, value
+from gomoku_net import GomokuNet, count_parameters, quantize_dynamic_linear, state_dict_size_mb
 
 
-def _count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def _seed_everything(seed):
+    if seed is None:
+        return
 
-
-def _state_dict_size_mb(model):
-    buffer = io.BytesIO()
-    torch.save(model.state_dict(), buffer)
-    return len(buffer.getvalue()) / (1024 * 1024)
-
-
-def _quantize_dynamic_linear(model):
-    cpu_model = copy.deepcopy(model).to("cpu").eval()
-    return torch.ao.quantization.quantize_dynamic(cpu_model, {nn.Linear}, dtype=torch.qint8)
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def train(
     board_size=15,
-    hidden_dim=256,
+    hidden_dim=1033,
+    trunk_layers=2,
     iterations=30,
     replay_capacity=50000,
     num_self_play_games=4,
@@ -62,16 +42,50 @@ def train(
     max_grad_norm=1.5,
     lr=1e-3,
     weight_decay=1e-4,
+    min_lr=1e-5,
+    use_amp=True,
+    policy_label_smoothing=0.03,
+    value_loss_type="huber",
+    seed=None,
 ):
+    from model import ReplayBuffer, run_training_iteration
+
+    _seed_everything(seed)
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = GomokuNet(board_size=board_size, hidden_dim=hidden_dim).to(device)
+    use_amp = bool(use_amp and device.type == "cuda")
+
+    net = GomokuNet(
+        board_size=board_size,
+        hidden_dim=hidden_dim,
+        trunk_layers=trunk_layers,
+    ).to(device)
     optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+
+    total_updates = max(1, int(iterations) * max(1, int(updates_per_iteration)))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_updates,
+        eta_min=max(0.0, min(float(min_lr), float(lr))),
+    )
+
+    scaler = None
+    if use_amp:
+        try:
+            scaler = torch.amp.GradScaler("cuda", enabled=True)
+        except (AttributeError, TypeError):
+            scaler = torch.cuda.amp.GradScaler(enabled=True)
+
     replay = ReplayBuffer(capacity=replay_capacity)
 
     print(
-        f"device={device}, params={_count_parameters(net):,}, "
-        f"state_dict_size={_state_dict_size_mb(net):.2f} MB, "
-        f"cpuct={cpuct}, sims={simulations}, augment={augment_symmetries}"
+        f"device={device}, amp={use_amp}, params={count_parameters(net):,}, "
+        f"hidden_dim={hidden_dim}, trunk_layers={trunk_layers}, "
+        f"state_dict_size={state_dict_size_mb(net):.2f} MB, "
+        f"cpuct={cpuct}, sims={simulations}, augment={augment_symmetries}, "
+        f"loss={value_loss_type}, label_smoothing={policy_label_smoothing}, seed={seed}"
     )
 
     for i in range(iterations):
@@ -96,6 +110,11 @@ def train(
             augment_symmetries=augment_symmetries,
             max_grad_norm=max_grad_norm,
             device=device,
+            scheduler=scheduler,
+            scaler=scaler,
+            use_amp=use_amp,
+            policy_label_smoothing=policy_label_smoothing,
+            value_loss_type=value_loss_type,
         )
         print(f"[iter {i + 1:03d}/{iterations}] {summary}")
 
@@ -105,7 +124,8 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description="Train Gomoku model and optionally compress it.")
     parser.add_argument("--board-size", type=int, default=15)
-    parser.add_argument("--hidden-dim", type=int, default=256, help="Reduce this to shrink model size.")
+    parser.add_argument("--hidden-dim", type=int, default=1033, help="Lower this to shrink model size.")
+    parser.add_argument("--trunk-layers", type=int, default=2, help="Use 1 for the legacy single-hidden-layer model.")
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--self-play-games", type=int, default=4)
     parser.add_argument("--simulations", type=int, default=200)
@@ -128,7 +148,12 @@ def main():
     parser.add_argument("--max-grad-norm", type=float, default=1.5)
     parser.add_argument("--replay-capacity", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--policy-label-smoothing", type=float, default=0.03)
+    parser.add_argument("--value-loss-type", choices=("mse", "huber"), default="huber")
     parser.add_argument("--save-path", default="gomoku_model.pt")
     parser.add_argument("--quantize", action="store_true", help="Export int8 dynamic-quantized model.")
     parser.add_argument("--quantized-save-path", default="gomoku_model_int8.pt")
@@ -138,6 +163,7 @@ def main():
     net, device = train(
         board_size=args.board_size,
         hidden_dim=args.hidden_dim,
+        trunk_layers=args.trunk_layers,
         iterations=args.iterations,
         replay_capacity=args.replay_capacity,
         num_self_play_games=args.self_play_games,
@@ -156,18 +182,23 @@ def main():
         augment_symmetries=not args.no_augment_symmetries,
         max_grad_norm=args.max_grad_norm,
         lr=args.lr,
+        min_lr=args.min_lr,
         weight_decay=args.weight_decay,
+        use_amp=not args.no_amp,
+        policy_label_smoothing=args.policy_label_smoothing,
+        value_loss_type=args.value_loss_type,
+        seed=args.seed,
     )
 
     net_cpu = net.to("cpu").eval()
     torch.save(net_cpu.state_dict(), args.save_path)
-    fp32_size = _state_dict_size_mb(net_cpu)
+    fp32_size = state_dict_size_mb(net_cpu)
     print(f"saved fp32 model -> {args.save_path} ({fp32_size:.2f} MB)")
 
     if args.quantize:
-        qnet = _quantize_dynamic_linear(net_cpu)
+        qnet = quantize_dynamic_linear(net_cpu)
         torch.save(qnet.state_dict(), args.quantized_save_path)
-        int8_size = _state_dict_size_mb(qnet)
+        int8_size = state_dict_size_mb(qnet)
         ratio = (int8_size / fp32_size) if fp32_size > 1e-12 else 1.0
         print(
             f"saved int8 model -> {args.quantized_save_path} "

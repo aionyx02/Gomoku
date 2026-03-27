@@ -1,8 +1,10 @@
 import math
 from collections import deque
+from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import gomoku_ai
 
@@ -835,6 +837,24 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+def _smooth_target_policies(target_policies, smoothing):
+    smoothing = float(smoothing)
+    if smoothing <= 0.0:
+        return target_policies
+
+    policies = target_policies
+    legal_mask = (policies > 0).to(dtype=policies.dtype)
+    legal_count = legal_mask.sum(dim=1, keepdim=True)
+    uniform_all = torch.full_like(policies, 1.0 / float(policies.shape[1]))
+    uniform_legal = torch.where(
+        legal_count > 0,
+        legal_mask / legal_count.clamp_min(1.0),
+        uniform_all,
+    )
+    mixed = (1.0 - smoothing) * policies + smoothing * uniform_legal
+    return mixed / mixed.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+
 def train_step(
     model,
     optimizer,
@@ -843,6 +863,11 @@ def train_step(
     policy_loss_weight=1.0,
     value_loss_weight=1.0,
     max_grad_norm=None,
+    scheduler=None,
+    scaler=None,
+    use_amp=False,
+    policy_label_smoothing=0.0,
+    value_loss_type="mse",
 ):
     states, target_policies, target_values = batch
 
@@ -855,26 +880,56 @@ def train_step(
     states_t = torch.as_tensor(states, dtype=torch.float32, device=device)
     target_policies_t = torch.as_tensor(target_policies, dtype=torch.float32, device=device)
     target_values_t = torch.as_tensor(target_values, dtype=torch.float32, device=device).view(-1)
+    target_policies_t = _smooth_target_policies(target_policies_t, policy_label_smoothing)
 
     model.train()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
-    policy_output, value_output = model(states_t)
-    value_output = value_output.view(-1)
-    log_policy = _policy_log_probs_torch(policy_output)
+    autocast_enabled = bool(use_amp and device.type == "cuda")
+    if autocast_enabled:
+        try:
+            amp_ctx = torch.autocast(device_type="cuda", dtype=torch.float16)
+        except AttributeError:
+            amp_ctx = torch.cuda.amp.autocast()
+    else:
+        amp_ctx = nullcontext()
 
-    policy_loss = -(target_policies_t * log_policy).sum(dim=1).mean()
-    value_loss = torch.mean((value_output - target_values_t) ** 2)
-    loss = policy_loss_weight * policy_loss + value_loss_weight * value_loss
+    with amp_ctx:
+        policy_output, value_output = model(states_t)
+        value_output = value_output.view(-1)
+        log_policy = _policy_log_probs_torch(policy_output)
 
-    loss.backward()
+        policy_loss = -(target_policies_t * log_policy).sum(dim=1).mean()
+        if str(value_loss_type).lower() == "huber":
+            value_loss = F.smooth_l1_loss(value_output, target_values_t)
+        else:
+            value_loss = F.mse_loss(value_output, target_values_t)
+        loss = policy_loss_weight * policy_loss + value_loss_weight * value_loss
+
     grad_norm = None
-    if max_grad_norm is not None and float(max_grad_norm) > 0:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm=float(max_grad_norm),
-        )
-    optimizer.step()
+    if scaler is not None and autocast_enabled:
+        scaler.scale(loss).backward()
+        if max_grad_norm is not None and float(max_grad_norm) > 0:
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=float(max_grad_norm),
+            )
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        if max_grad_norm is not None and float(max_grad_norm) > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=float(max_grad_norm),
+            )
+        optimizer.step()
+
+    if scheduler is not None:
+        scheduler.step()
+
+    current_lr = float(optimizer.param_groups[0]["lr"])
 
     return {
         "loss": float(loss.item()),
@@ -882,6 +937,7 @@ def train_step(
         "value_loss": float(value_loss.item()),
         "batch_size": int(states_t.shape[0]),
         "grad_norm": float(grad_norm.item()) if grad_norm is not None else None,
+        "lr": current_lr,
     }
 
 
@@ -906,6 +962,11 @@ def run_training_iteration(
     augment_symmetries=True,
     max_grad_norm=None,
     device=None,
+    scheduler=None,
+    scaler=None,
+    use_amp=False,
+    policy_label_smoothing=0.0,
+    value_loss_type="mse",
 ):
     game_lengths = []
     raw_samples_collected = 0
@@ -942,6 +1003,11 @@ def run_training_iteration(
                     batch,
                     device=device,
                     max_grad_norm=max_grad_norm,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    use_amp=use_amp,
+                    policy_label_smoothing=policy_label_smoothing,
+                    value_loss_type=value_loss_type,
                 )
             )
 
@@ -957,8 +1023,8 @@ def run_training_iteration(
         summary["avg_loss"] = float(np.mean([u["loss"] for u in updates]))
         summary["avg_policy_loss"] = float(np.mean([u["policy_loss"] for u in updates]))
         summary["avg_value_loss"] = float(np.mean([u["value_loss"] for u in updates]))
+        summary["avg_lr"] = float(np.mean([u["lr"] for u in updates]))
         grad_norms = [u["grad_norm"] for u in updates if u["grad_norm"] is not None]
         if grad_norms:
             summary["avg_grad_norm"] = float(np.mean(grad_norms))
     return summary
-
