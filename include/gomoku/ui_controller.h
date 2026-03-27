@@ -8,22 +8,30 @@
 #define GOMOKU_UI_CONTROLLER_H
 
 #include "engine.h"
-#include <ftxui/component/component.hpp>
-#include <ftxui/component/screen_interactive.hpp>
+#include <memory>
 #include <string>
 #include <vector>
+
+namespace ftxui {
+    class ComponentBase;
+    class Node;
+    using Component = std::shared_ptr<ComponentBase>;
+    using Element = std::shared_ptr<Node>;
+}
 
 namespace UI {
     class Controller {
     public:
         explicit Controller(gomoku::Board& board);
+        ~Controller();
 
         void Start();
 
     private:
+        struct ScreenState;
         gomoku::Board& board;
-        ftxui::ScreenInteractive screen = ftxui::ScreenInteractive::Fullscreen();
-        std::vector<std::string> menu_entries = {"Start Game (PvP)","Start Geme (PvE)", "Exit"};
+        std::unique_ptr<ScreenState> screen_state;
+        std::vector<std::string> menu_entries = {"Start Game (PvP)", "Start Game (PvE)", "Exit"};
 
         int menu_selected = 0;
         int active_index = 0;

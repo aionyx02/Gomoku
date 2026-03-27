@@ -3,11 +3,13 @@
 #include "ftxui/component/component_base.hpp"
 #include "ftxui/component/component_options.hpp"
 #include "ftxui/component/event.hpp"
+#include "ftxui/component/screen_interactive.hpp"
 #include "ftxui/dom/elements.hpp"
 #include "ftxui/util/ref.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -133,7 +135,15 @@ namespace UI {
         }
     };
 
-    Controller::Controller(gomoku::Board& board) : board(board) {}
+    struct Controller::ScreenState {
+        ScreenInteractive screen = ScreenInteractive::Fullscreen();
+    };
+
+    Controller::Controller(gomoku::Board& board)
+        : board(board),
+          screen_state(std::make_unique<ScreenState>()) {}
+
+    Controller::~Controller() = default;
 
     void Controller::Start() {
         const auto container = Container::Tab({
@@ -143,7 +153,7 @@ namespace UI {
             this->RenderEndPage()
         }, &active_index);
 
-        this->screen.Loop(container);
+        this->screen_state->screen.Loop(container);
     }
     Component Controller::RenderFrontPage() {
         const auto menu = Menu(&menu_entries, &menu_selected);
@@ -171,7 +181,7 @@ namespace UI {
                 return true;
             }
             if (this->menu_selected == 2) {
-                this->screen.Exit();
+                this->screen_state->screen.Exit();
                 return true;
             }
 
