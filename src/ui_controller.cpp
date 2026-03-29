@@ -1,15 +1,11 @@
 #include "gomoku/ui_controller.h"
 #include "ftxui/component/component.hpp"
 #include "ftxui/component/component_base.hpp"
-#include "ftxui/component/component_options.hpp"
 #include "ftxui/component/event.hpp"
 #include "ftxui/component/screen_interactive.hpp"
 #include "ftxui/dom/elements.hpp"
-#include "ftxui/util/ref.hpp"
-#include <algorithm>
 #include <array>
 #include <cctype>
-#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -34,691 +30,380 @@ namespace UI {
 #else
         constexpr const char* kSourceDir = ".";
 #endif
-
 #ifdef GOMOKU_PYTHON_EXECUTABLE
         constexpr auto kPythonExecutable = GOMOKU_PYTHON_EXECUTABLE;
 #else
         constexpr const char* kPythonExecutable = "python";
 #endif
 
-        struct AIMoveResult {
-            std::optional<std::pair<int, int> > move;
-            std::string reason;
-        };
+        // ── helpers ──────────────────────────────────────────────────────────
 
-        std::string QuoteArg(const std::string& value) {
-            std::string escaped;
-            escaped.reserve(value.size());
-            for (const char ch : value) {
-                if (ch == '"')
-                    escaped += "\\\"";
-                else
-                    escaped.push_back(ch);
-            }
-            return "\"" + escaped + "\"";
+        std::string QuoteArg(const std::string& s) {
+            std::string out = "\"";
+            for (char ch : s) { if (ch == '"') out += "\\\""; else out += ch; }
+            return out + "\"";
         }
 
-        fs::path GetExecutableDir() {
+        std::string CompactMessage(const std::string& text, size_t max_len = 140) {
+            std::string out;
+            bool sp = false;
+            for (unsigned char ch : text) {
+                if (std::isspace(ch)) { if (!sp && !out.empty()) out += ' '; sp = true; }
+                else { out += ch; sp = false; }
+            }
+            return out.size() <= max_len ? out : out.substr(0, max_len - 3) + "...";
+        }
+
+        // ── path / python discovery ───────────────────────────────────────────
+
+        fs::path ExeDir() {
 #if defined(_WIN32)
-            std::array<char, 4096> buffer {};
-            if (const DWORD len = GetModuleFileNameA(nullptr, buffer.data(), static_cast<DWORD>(buffer.size())); len > 0 && len < buffer.size())
-                return fs::path(std::string(buffer.data(), len)).parent_path();
+            std::array<char, 4096> buf{};
+            if (DWORD n = GetModuleFileNameA(nullptr, buf.data(), (DWORD)buf.size()); n > 0 && n < buf.size())
+                return fs::path(std::string(buf.data(), n)).parent_path();
 #endif
             std::error_code ec;
-            const fs::path current = fs::current_path(ec);
-            if (!ec)
-                return current;
-            return fs::path(".");
+            return fs::current_path(ec);
         }
 
-        std::vector<fs::path> CollectBaseDirs() {
-            std::vector<fs::path> bases;
-            const auto add_unique = [&bases](const fs::path& raw) {
-                if (raw.empty())
-                    return;
+        std::vector<fs::path> BaseDirs() {
+            std::vector<fs::path> out;
+            auto add = [&](fs::path p) {
                 std::error_code ec;
-                fs::path normalized = fs::absolute(raw, ec);
-                if (ec)
-                    normalized = raw.lexically_normal();
-                else
-                    normalized = normalized.lexically_normal();
-
-                const std::string key = normalized.generic_string();
-                const bool exists = std::ranges::any_of(bases
-                                                        ,
-                                                        [&key](const fs::path& existing) { return existing.generic_string() == key; }
-                );
-                if (!exists)
-                    bases.push_back(normalized);
+                p = fs::absolute(p, ec).lexically_normal();
+                std::string key = p.generic_string();
+                for (auto& x : out) if (x.generic_string() == key) return;
+                out.push_back(p);
             };
-
-            const fs::path exe_dir = GetExecutableDir();
-            add_unique(fs::path(kSourceDir));
-            add_unique(exe_dir);
-            add_unique(exe_dir.parent_path());
-            add_unique(fs::current_path());
-            add_unique(fs::current_path().parent_path());
-            return bases;
+            fs::path exe = ExeDir();
+            add(fs::path(kSourceDir));
+            add(exe);
+            add(exe.parent_path());
+            add(fs::current_path());
+            add(fs::current_path().parent_path());
+            return out;
         }
 
-        std::optional<fs::path> FindFileInBases(
-            const std::vector<fs::path>& bases,
-            const std::string& filename
-        ) {
-            for (const auto& base : bases) {
-                const fs::path candidate = (base / filename).lexically_normal();
-                if (std::error_code ec; fs::exists(candidate, ec) && fs::is_regular_file(candidate, ec))
-                    return candidate;
+        std::optional<fs::path> FindFile(const std::vector<fs::path>& bases, const std::string& name) {
+            for (auto& b : bases) {
+                fs::path c = (b / name).lexically_normal();
+                if (std::error_code ec; fs::exists(c, ec) && fs::is_regular_file(c, ec)) return c;
             }
             return std::nullopt;
         }
 
-        std::string BuildSearchedPathsSummary(
-            const std::vector<fs::path>& bases,
-            const std::string& filename
-        ) {
-            std::string joined;
-            for (const auto& base : bases) {
-                if (!joined.empty())
-                    joined += ", ";
-                joined += (base / filename).generic_string();
-            }
-            return joined;
+        std::string SearchedPaths(const std::vector<fs::path>& bases, const std::string& name) {
+            std::string out;
+            for (auto& b : bases) { if (!out.empty()) out += ", "; out += (b / name).generic_string(); }
+            return out;
         }
 
-        bool IsPathLikeCommand(const std::string& candidate) {
-            return candidate.find('\\') != std::string::npos
-                || candidate.find('/') != std::string::npos
-                || candidate.find(':') != std::string::npos;
-        }
-
-        std::string NormalizeKey(std::string value) {
-            std::ranges::transform(value
-                                   ,
-                                   value.begin(),
-                                   [](const unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
-            );
-            return value;
-        }
-
-        std::vector<std::string> ResolvePythonCommands(const std::vector<fs::path>& bases) {
-            std::vector<std::string> resolved;
-            std::vector<std::string> visited_keys;
-            const auto push_unique = [&resolved, &visited_keys](const std::string& key, const std::string& value) {
-                if (value.empty())
-                    return;
-                const std::string lowered = NormalizeKey(key);
-                if (std::ranges::find(visited_keys, lowered) != visited_keys.end())
-                    return;
-                visited_keys.push_back(lowered);
-                resolved.push_back(value);
+        std::vector<std::string> PythonCommands(const std::vector<fs::path>& bases) {
+            std::vector<std::string> cmds, seen;
+            auto push = [&](std::string cmd) {
+                if (cmd.empty()) return;
+                // strip surrounding quotes
+                if (cmd.size() >= 2 && cmd.front() == '"' && cmd.back() == '"')
+                    cmd = cmd.substr(1, cmd.size() - 2);
+                // normalise key
+                std::string key = cmd;
+                for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+                if (std::ranges::find(seen, key) != seen.end()) return;
+                seen.push_back(key);
+                bool is_path = cmd.find_first_of("/\\:") != std::string::npos;
+                if (is_path) {
+                    if (std::error_code ec; !fs::exists(cmd, ec)) return;
+                    cmd = fs::path(cmd).lexically_normal().generic_string();
+                }
+                cmds.push_back(cmd);
             };
-
-            std::vector<std::string> candidates;
-
-            if (const char* env_py = std::getenv("GOMOKU_PYTHON_EXECUTABLE"); env_py != nullptr && env_py[0] != '\0')
-                candidates.emplace_back(env_py);
-
-            candidates.emplace_back(kPythonExecutable);
-
-            for (const auto& base : bases) {
-                candidates.push_back((base / ".gomoku-python/Scripts/python.exe").generic_string());
-                candidates.push_back((base / ".gomoku-python/python.exe").generic_string());
-                candidates.push_back((base / ".venv/Scripts/python.exe").generic_string());
-                candidates.push_back((base / ".venv/bin/python3").generic_string());
-                candidates.push_back((base / ".venv/bin/python").generic_string());
-                candidates.push_back((base / "Scripts/python.exe").generic_string());
-                candidates.push_back((base / "python/bin/python3").generic_string());
-                candidates.push_back((base / "python/bin/python").generic_string());
+            if (const char* e = std::getenv("GOMOKU_PYTHON_EXECUTABLE"); e && *e) push(e);
+            push(kPythonExecutable);
+            for (auto& b : bases) {
+                for (auto rel : {".gomoku-python/Scripts/python.exe",
+                                 ".gomoku-python/python.exe",
+                                 ".venv/Scripts/python.exe",
+                                 ".venv/bin/python3",
+                                 ".venv/bin/python",
+                                 "Scripts/python.exe",
+                                 "python/bin/python3",
+                                 "python/bin/python"})
+                    push((b / rel).generic_string());
             }
-
-            candidates.emplace_back("python");
-            candidates.emplace_back("python3");
-
-            for (auto candidate : candidates) {
-                if (candidate.empty())
-                    continue;
-
-
-                if (candidate.size() >= 2 && candidate.front() == '"' && candidate.back() == '"')
-                    candidate = candidate.substr(1, candidate.size() - 2);
-
-                const bool looks_like_path = IsPathLikeCommand(candidate);
-                const std::string key = looks_like_path ? fs::path(candidate).generic_string() : candidate;
-
-                if (!looks_like_path) {
-                    push_unique(key, candidate);
-                    continue;
-                }
-
-                if (std::error_code ec; fs::exists(fs::path(candidate), ec))
-                    push_unique(
-                        key,
-                        fs::path(candidate).lexically_normal().generic_string()
-                    );
-            }
-
-            return resolved;
+            push("python"); push("python3");
+            return cmds;
         }
 
-        std::string CompactMessage(const std::string &text, const size_t max_len = 140) {
-            std::string compact;
-            compact.reserve(text.size());
-            bool in_space = false;
-            for (const unsigned char ch : text) {
-                if (std::isspace(ch) != 0) {
-                    if (!in_space && !compact.empty())
-                        compact.push_back(' ');
-                    in_space = true;
-                    continue;
-                }
-                compact.push_back(static_cast<char>(ch));
-                in_space = false;
-            }
-
-            if (compact.size() <= max_len)
-                return compact;
-
-            return compact.substr(0, max_len - 3) + "...";
-        }
-
-        std::optional<std::pair<int, int> > ParseMoveFromOutput(const std::string& output) {
-            std::istringstream lines(output);
-            std::string line;
-            std::optional<std::pair<int, int> > parsed_move;
-            while (std::getline(lines, line)) {
-                std::istringstream parser(line);
-                int x = -1;
-                int y = -1;
-                if (std::string extra; (parser >> x >> y) && !(parser >> extra))
-                    parsed_move = std::make_pair(x, y);
-            }
-            return parsed_move;
-        }
+        // ── process execution ────────────────────────────────────────────────
 
 #if defined(_WIN32)
-        int RunProcessCapture(const std::string& cmdline, std::string& output, std::string* startup_error = nullptr) {
-            SECURITY_ATTRIBUTES sa {};
-            sa.nLength = sizeof(sa);
-            sa.bInheritHandle = TRUE;
+        int RunProcess(const std::string& cmdline, std::string& output) {
+            SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+            HANDLE rp{}, wp{};
+            if (!CreatePipe(&rp, &wp, &sa, 0)) return -1;
+            SetHandleInformation(rp, HANDLE_FLAG_INHERIT, 0);
 
-            HANDLE read_pipe = nullptr;
-            HANDLE write_pipe = nullptr;
+            STARTUPINFOA si{};
+            si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdOutput = si.hStdError = wp;
+            si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
 
-            if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) {
-                // if (startup_error != nullptr)
-                //     *startup_error = "CreatePipe failed";
-                return -1;
+            PROCESS_INFORMATION pi{};
+            std::vector<char> cmd(cmdline.begin(), cmdline.end()); cmd.push_back('\0');
+            if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                CloseHandle(rp); CloseHandle(wp); return -1;
             }
-            if (!SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0)) {
-                CloseHandle(read_pipe);
-                CloseHandle(write_pipe);
-                // if (startup_error != nullptr)
-                //     *startup_error = "SetHandleInformation failed";
-                return -1;
-            }
+            CloseHandle(wp);
 
-            STARTUPINFOA si {};
-            si.cb = sizeof(si);
-            si.dwFlags = STARTF_USESTDHANDLES;
-            si.hStdOutput = write_pipe;
-            si.hStdError = write_pipe;
-            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
-            PROCESS_INFORMATION pi {};
-            std::vector<char> mutable_cmd(cmdline.begin(), cmdline.end());
-            mutable_cmd.push_back('\0');
-
-            const BOOL ok = CreateProcessA(
-                nullptr,
-                mutable_cmd.data(),
-                nullptr,
-                nullptr,
-                TRUE,
-                CREATE_NO_WINDOW,
-                nullptr,
-                nullptr,
-                &si,
-                &pi
-            );
-
-            CloseHandle(write_pipe);
-            //
-            // if (!ok) {
-            //     CloseHandle(read_pipe);
-            //     if (startup_error != nullptr) {
-            //         const DWORD error = GetLastError();
-            //         *startup_error = "CreateProcess failed (" + std::to_string(error) + ")";
-            //     }
-            //     return -1;
-            // }
-
-            std::array<char, 4096> buffer {};
-            DWORD bytes_read = 0;
-            while (ReadFile(read_pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read, nullptr)
-                   && bytes_read > 0) {
-                output.append(buffer.data(), bytes_read);
-            }
-
-            CloseHandle(read_pipe);
+            std::array<char, 4096> buf{};
+            DWORD n{};
+            while (ReadFile(rp, buf.data(), (DWORD)buf.size(), &n, nullptr) && n) output.append(buf.data(), n);
+            CloseHandle(rp);
             WaitForSingleObject(pi.hProcess, INFINITE);
-
-            DWORD exit_code = 1;
-            GetExitCodeProcess(pi.hProcess, &exit_code);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-            return static_cast<int>(exit_code);
+            DWORD ec = 1; GetExitCodeProcess(pi.hProcess, &ec);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            return (int)ec;
         }
 #endif
 
-        char StoneToSymbol(const gomoku::Stone stone) {
-            if (stone == gomoku::Stone::BLACK)
-                return 'B';
-            if (stone == gomoku::Stone::WHITE)
-                return 'W';
-            return '.';
+        // ── board helpers ────────────────────────────────────────────────────
+
+        char StoneChar(gomoku::Stone s) {
+            return s == gomoku::Stone::BLACK ? 'B' : s == gomoku::Stone::WHITE ? 'W' : '.';
         }
 
-        std::string SerializeBoardFlat(const gomoku::Board& board) {
-            const int size = board.getSize();
-            std::string serialized;
-            serialized.reserve(size * size);
+        std::string SerializeBoard(const gomoku::Board& b) {
+            int sz = b.getSize();
+            std::string out; out.reserve(sz * sz);
+            for (int y = 0; y < sz; ++y)
+                for (int x = 0; x < sz; ++x)
+                    out += StoneChar(b.getStone(x, y));
+            return out;
+        }
 
-            for (int y = 0; y < size; ++y) {
-                for (int x = 0; x < size; ++x)
-                    serialized.push_back(StoneToSymbol(board.getStone(x, y)));
+        std::optional<std::pair<int,int>> ParseMove(const std::string& output) {
+            std::istringstream ss(output); std::string line;
+            std::optional<std::pair<int,int>> result;
+            while (std::getline(ss, line)) {
+                std::istringstream ls(line); int x, y; std::string extra;
+                if ((ls >> x >> y) && !(ls >> extra)) result = {x, y};
             }
-
-            return serialized;
+            return result;
         }
+
+        // ── AI query ─────────────────────────────────────────────────────────
+
+        struct AIMoveResult { std::optional<std::pair<int,int>> move; std::string reason; };
 
         AIMoveResult QueryAIMove(const gomoku::Board& board) {
-            const char current_symbol = StoneToSymbol(board.getCurrentPlayer());
-            const auto base_dirs = CollectBaseDirs();
-            const auto script_path = [&]() -> std::optional<fs::path> {
-                if (auto p = FindFileInBases(base_dirs, "runModelAndReturnPoint.py"); p.has_value())
-                    return p;
-                return FindFileInBases(base_dirs, "python/runModelAndReturnPoint.py");
-            }();
-            if (!script_path.has_value()) {
-                return AIMoveResult{ std::nullopt,
-                    "runModelAndReturnPoint.py not found; searched: "
-                    + CompactMessage(BuildSearchedPathsSummary(base_dirs, "runModelAndReturnPoint.py"), 220)
-                };
-            }
+            auto bases = BaseDirs();
 
-            const auto model_path = FindFileInBases(base_dirs, "gomoku_model.pt");
-            if (!model_path.has_value()) {
-                return AIMoveResult{
-                    std::nullopt,
-                    "gomoku_model.pt not found; searched: "
-                    + CompactMessage(BuildSearchedPathsSummary(base_dirs, "gomoku_model.pt"), 220),
-                };
-            }
+            auto script = FindFile(bases, "runModelAndReturnPoint.py");
+            if (!script) script = FindFile(bases, "python/runModelAndReturnPoint.py");
+            if (!script) return {std::nullopt, "runModelAndReturnPoint.py not found; searched: "
+                                 + CompactMessage(SearchedPaths(bases, "runModelAndReturnPoint.py"), 220)};
 
-            const std::string board_text = SerializeBoardFlat(board);
-            const auto python_commands = ResolvePythonCommands(base_dirs);
-            if (python_commands.empty()) {
-                return AIMoveResult{
-                    std::nullopt,
-                    "no usable python command was found (checked env, .gomoku-python, .venv, PATH)"
-                };
-            }
+            auto model = FindFile(bases, "gomoku_model.pt");
+            if (!model) return {std::nullopt, "gomoku_model.pt not found; searched: "
+                                + CompactMessage(SearchedPaths(bases, "gomoku_model.pt"), 220)};
 
-            std::vector<std::string> attempt_summaries;
-            attempt_summaries.reserve(python_commands.size());
+            auto pycmds = PythonCommands(bases);
+            if (pycmds.empty()) return {std::nullopt, "no usable python command found"};
+
+            const std::string board_text = SerializeBoard(board);
+            const char cur = StoneChar(board.getCurrentPlayer());
+            const std::string args =
+                "--board-size " + std::to_string(board.getSize()) + " "
+                "--model-path " + QuoteArg(model->generic_string()) + " "
+                "--current " + std::string(1, cur) + " "
+                "--board " + QuoteArg(board_text);
 
 #if defined(_WIN32)
             SetCurrentDirectoryA(fs::path(kSourceDir).string().c_str());
 #else
-            {
-                std::error_code ec;
-                fs::current_path(fs::path(kSourceDir), ec);
-            }
+            { std::error_code ec; fs::current_path(fs::path(kSourceDir), ec); }
 #endif
 
-            for (const auto& python_command : python_commands) {
-                attempt_summaries.push_back(
-                    "[try] py=" + python_command
-                    + " script=" + script_path->generic_string()
-                    + " model=" + model_path->generic_string()
-                );
-
+            std::vector<std::string> log;
+            for (auto& py : pycmds) {
                 std::string output;
-                int exit_code = 0;
-
 #if defined(_WIN32)
-                const std::string process_command =
-                    QuoteArg(python_command) + " " +
-                    QuoteArg(script_path->generic_string()) + " "
-                    "--board-size " + std::to_string(board.getSize()) + " "
-                    "--model-path " + QuoteArg(model_path->generic_string()) + " "
-                    "--current " + std::string(1, current_symbol) + " "
-                    "--board " + QuoteArg(board_text);
-
-                std::string startup_error;
-                exit_code = RunProcessCapture(process_command, output, &startup_error);
-                if (exit_code == -1) {
-                    attempt_summaries.push_back(
-                        "python=" + CompactMessage(python_command, 80) +
-                        " -> cannot spawn process (" + CompactMessage(startup_error, 120) + ")"
-                    );
-                    continue;
-                }
+                std::string cmd = QuoteArg(py) + " " + QuoteArg(script->generic_string()) + " " + args;
+                int rc = RunProcess(cmd, output);
 #else
-                const std::string command =
-                    QuoteArg(python_command) + " " +
-                    QuoteArg(script_path->generic_string()) + " "
-                    "--board-size " + std::to_string(board.getSize()) + " "
-                    "--model-path " + QuoteArg(model_path->generic_string()) + " "
-                    "--current " + std::string(1, current_symbol) + " "
-                    "--board " + QuoteArg(board_text) + " 2>&1";
-
-                FILE* pipe = popen(command.c_str(), "r");
-                if (pipe == nullptr) {
-                    attempt_summaries.push_back(
-                        "python=" + CompactMessage(python_command, 80) + " -> cannot spawn process"
-                    );
-                    continue;
-                }
-
-                std::array<char, 256> buffer {};
-                while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr)
-                    output += buffer.data();
-
-                exit_code = pclose(pipe);
+                std::string cmd = QuoteArg(py) + " " + QuoteArg(script->generic_string()) + " " + args + " 2>&1";
+                FILE* pipe = popen(cmd.c_str(), "r");
+                if (!pipe) { log.push_back("py=" + py + " -> cannot spawn"); continue; }
+                std::array<char, 256> buf{};
+                while (fgets(buf.data(), (int)buf.size(), pipe)) output += buf.data();
+                int rc = pclose(pipe);
 #endif
-                if (exit_code != 0) {
-                    const std::string detail = CompactMessage(output);
-                    attempt_summaries.push_back(
-                        "python=" + CompactMessage(python_command, 80) + " -> exit=" + std::to_string(exit_code)
-                        + (detail.empty() ? "" : (": " + detail))
-                    );
-                    continue;
-                }
+                if (rc != 0) { log.push_back("py=" + py + " exit=" + std::to_string(rc) + ": " + CompactMessage(output)); continue; }
 
-                const auto parsed_move = ParseMoveFromOutput(output);
-                if (!parsed_move.has_value()) {
-                    const std::string detail = CompactMessage(output);
-                    const std::string reason = detail.empty()
-                        ? "cannot parse AI move from script output (python=" + python_command + ")"
-                        : "cannot parse AI move from script output (python=" + python_command + "): " + detail;
-                    return AIMoveResult{std::nullopt, reason};
-                }
+                auto move = ParseMove(output);
+                if (!move) return {std::nullopt, "cannot parse AI move (py=" + py + "): " + CompactMessage(output)};
 
-                const auto [x, y] = parsed_move.value();
+                auto [x, y] = *move;
+                int sz = board.getSize();
+                if (x < 0 || x >= sz || y < 0 || y >= sz)
+                    return {std::nullopt, "AI move out of range: (" + std::to_string(x) + "," + std::to_string(y) + ")"};
 
-                if (const int size = board.getSize(); x < 0 || x >= size || y < 0 || y >= size) {
-                    return AIMoveResult{
-                        std::nullopt,
-                        "AI move out of board range: (" + std::to_string(x) + ", " + std::to_string(y) + ")",
-                    };
-                }
-
-                return AIMoveResult{std::make_pair(x, y), ""};
+                return {std::make_pair(x, y), ""};
             }
 
             std::string summary;
-            for (const auto& item : attempt_summaries) {
-                if (!summary.empty())
-                    summary += " | ";
-                summary += item;
+            for (auto& s : log) { if (!summary.empty()) summary += " | "; summary += s; }
+            if (FILE* f = fopen((fs::path(kSourceDir) / "ai_debug.log").string().c_str(), "w")) {
+                fprintf(f, "%s\n", summary.c_str()); fclose(f);
             }
-            {
-                const std::string& full_summary =  summary;
-                if (FILE* log = fopen((fs::path(kSourceDir) / "ai_debug.log").string().c_str(), "w")) {
-                    fprintf(log, "%s\n", full_summary.c_str());
-                    fclose(log);
-                }
-                return AIMoveResult{
-                    std::nullopt,
-                    "all python candidates failed: " + CompactMessage(full_summary, 1200)
-                };
-            }
+            return {std::nullopt, "all python candidates failed: " + CompactMessage(summary, 1200)};
         }
 
-        std::optional<std::pair<int, int> > FindFallbackMove(const gomoku::Board& board) {
-            const int size = board.getSize();
-            for (int y = 0; y < size; ++y) {
-                for (int x = 0; x < size; ++x) {
-                    if (board.getStone(x, y) == gomoku::Stone::EMPTY)
-                        return std::make_pair(x, y);
-                }
-            }
+        std::optional<std::pair<int,int>> FallbackMove(const gomoku::Board& b) {
+            int sz = b.getSize();
+            for (int y = 0; y < sz; ++y)
+                for (int x = 0; x < sz; ++x)
+                    if (b.getStone(x, y) == gomoku::Stone::EMPTY) return {{x, y}};
             return std::nullopt;
         }
     }
 
+    // ── InteractiveBoard ─────────────────────────────────────────────────────
+
     class InteractiveBoard : public ComponentBase {
     public:
-        std::function<Element()> renderLogic;
-        std::function<bool(Event)> eventLogic;
-
-        [[nodiscard]] Element OnRender() override {
-            return renderLogic();
-        }
-
-        [[nodiscard]] bool Focusable() const override {
-            return true;
-        }
-
-        bool OnEvent(const Event event) override {
-            return eventLogic(event);
-        }
+        std::function<Element()>    renderLogic;
+        std::function<bool(Event)>  eventLogic;
+        Element OnRender() override { return renderLogic(); }
+        bool Focusable() const override { return true; }
+        bool OnEvent(Event e) override { return eventLogic(e); }
     };
+
+    // ── Controller ───────────────────────────────────────────────────────────
 
     struct Controller::ScreenState {
         ScreenInteractive screen = ScreenInteractive::Fullscreen();
     };
 
     Controller::Controller(gomoku::Board& board)
-        : board(board),
-          screen_state(std::make_unique<ScreenState>()) {}
+        : board(board), screen_state(std::make_unique<ScreenState>()) {}
 
     Controller::~Controller() = default;
 
     void Controller::Start() {
-        const auto container = Container::Tab({
-            this->RenderFrontPage(),
-            this->RenderGameBoard(),
-            this->RenderGameAIBoard(),
-            this->RenderEndPage()
+        auto container = Container::Tab({
+            RenderFrontPage(),
+            RenderGameBoard(/*has_ai=*/false),
+            RenderGameBoard(/*has_ai=*/true),
+            RenderEndPage()
         }, &active_index);
-
-        this->screen_state->screen.Loop(container);
+        screen_state->screen.Loop(container);
     }
-    Component Controller::RenderFrontPage() {
-        const auto menu = Menu(&menu_entries, &menu_selected);
 
+    // Shared arrow-key cursor movement
+    bool Controller::HandleMove(const Event& event) {
+        if (event == Event::ArrowUp)    { current_y = std::max(0, current_y - 1); return true; }
+        if (event == Event::ArrowDown)  { current_y = std::min(kBoardSize - 1, current_y + 1); return true; }
+        if (event == Event::ArrowLeft)  { current_x = std::max(0, current_x - 1); return true; }
+        if (event == Event::ArrowRight) { current_x = std::min(kBoardSize - 1, current_x + 1); return true; }
+        return false;
+    }
+
+    Component Controller::RenderFrontPage() {
+        auto menu = Menu(&menu_entries, &menu_selected);
         auto component = Renderer(menu, [menu] {
             return vbox({
-                text("=== Gomoku===") | hcenter | bold | color(Color::Cyan),
+                text("=== Gomoku ===") | hcenter | bold | color(Color::Cyan),
                 separator(),
                 menu->Render() | hcenter,
                 separator(),
                 text("Use arrow keys to move, Enter/Space to place") | dim | hcenter
             }) | border | center;
         });
-
-        component |= CatchEvent([this](const Event& event) -> bool {
-            if (event != Event::Return)
-                return false;
-
-            if (this->menu_selected == 0) {
-                this->active_index = 1;
+        component |= CatchEvent([this](const Event& e) -> bool {
+            if (e != Event::Return) return false;
+            if (menu_selected == 0) { active_index = 1; return true; }
+            if (menu_selected == 1) {
+                active_index = 2;
+                board = gomoku::Board(kBoardSize);
+                current_x = current_y = kBoardSize / 2;
+                ai_status_text = "AI: ready (model expected at gomoku_model.pt)";
+                ai_used_fallback = false;
                 return true;
             }
-            if (this->menu_selected == 1) {
-                this->active_index = 2;
-                this->board = gomoku::Board(kBoardSize);
-                this->current_x = kBoardSize / 2;
-                this->current_y = kBoardSize / 2;
-                this->ai_status_text = "AI: ready (model expected at gomoku_model.pt)";
-                this->ai_used_fallback = false;
-                return true;
-            }
-            if (this->menu_selected == 2) {
-                this->screen_state->screen.Exit();
-                return true;
-            }
-
+            if (menu_selected == 2) { screen_state->screen.Exit(); return true; }
             return false;
         });
-
         return component;
     }
-    Component Controller::RenderGameAIBoard() {
+
+    // Single factory for both PvP and PvAI boards
+    Component Controller::RenderGameBoard(bool has_ai) {
         auto comp = std::make_shared<InteractiveBoard>();
+        comp->renderLogic = [this]() { return RenderGrid(); };
+        comp->eventLogic  = [this, has_ai](const Event& event) -> bool {
+            if (HandleMove(event)) return true;
 
-        comp->renderLogic = [this]() -> Element {
-            return RenderGrid();
-        };
+            if (event != Event::Return && event != Event::Character(' ')) return false;
+            if (!board.placeStone(current_x, current_y)) return false;
 
-        comp->eventLogic = [this](const Event& event) -> bool {
-            if (event == Event::ArrowUp) {
-                this->current_y = std::max(0, this->current_y - 1);
-                return true;
-            }
-            if (event == Event::ArrowDown) {
-                this->current_y = std::min(kBoardSize - 1, this->current_y + 1);
-                return true;
-            }
-            if (event == Event::ArrowLeft) {
-                this->current_x = std::max(0, this->current_x - 1);
-                return true;
-            }
-            if (event == Event::ArrowRight) {
-                this->current_x = std::min(kBoardSize - 1, this->current_x + 1);
-                return true;
-            }
+            if (board.getStatus() != gomoku::GameStatus::PLAYING) { active_index = 3; return true; }
 
-            if (event == Event::Return || event == Event::Character(' ')) {
-                if (this->board.placeStone(this->current_x, this->current_y)) {
-                    if (this->board.getStatus() != gomoku::GameStatus::PLAYING)
-                        this->active_index = 3;
+            if (has_ai) {
+                bool placed = false;
+                std::string fallback_reason = "unknown AI error";
 
-                    if (this->board.getStatus() == gomoku::GameStatus::PLAYING) {
-                        bool ai_placed = false;
-                        std::string fallback_reason = "unknown AI error";
+                if (auto [move, reason] = QueryAIMove(board); move) {
+                    auto [ax, ay] = *move;
+                    if ((placed = board.placeStone(ax, ay))) {
+                        current_x = ax; current_y = ay;
+                        ai_status_text = "AI(model): move (" + std::to_string(ax) + "," + std::to_string(ay) + ")";
+                        ai_used_fallback = false;
+                    } else { fallback_reason = "model returned an occupied or invalid cell"; }
+                } else { fallback_reason = reason; }
 
-                        if (const auto [move, reason] = QueryAIMove(this->board); move.has_value()) {
-                            const auto [ai_x, ai_y] = move.value();
-                            ai_placed = this->board.placeStone(ai_x, ai_y);
-                            if (ai_placed) {
-                                this->current_x = ai_x;
-                                this->current_y = ai_y;
-                                this->ai_status_text = "AI(model): move (" + std::to_string(ai_x) + ", " +
-                                                       std::to_string(ai_y) + ")";
-                                this->ai_used_fallback = false;
-                            } else {
-                                fallback_reason = "model returned an occupied or invalid cell";
-                            }
-                        } else {
-                            fallback_reason = reason;
+                if (!placed) {
+                    if (auto fb = FallbackMove(board)) {
+                        auto [fx, fy] = *fb;
+                        if (board.placeStone(fx, fy)) {
+                            current_x = fx; current_y = fy;
+                            ai_status_text = "AI(fallback): move (" + std::to_string(fx) + "," + std::to_string(fy)
+                                             + ") | reason: " + fallback_reason;
+                            ai_used_fallback = true;
                         }
-
-                        if (!ai_placed) {
-                            if (const auto fallback = FindFallbackMove(this->board); fallback.has_value()) {
-                                if (const auto [fallback_x, fallback_y] = fallback.value(); this->board.placeStone(fallback_x, fallback_y)) {
-                                    this->current_x = fallback_x;
-                                    this->current_y = fallback_y;
-                                    this->ai_status_text = "AI(fallback): move (" + std::to_string(fallback_x) +
-                                                           ", " + std::to_string(fallback_y) + ") | reason: " +
-                                                           fallback_reason;
-                                    this->ai_used_fallback = true;
-                                }
-                            } else {
-                                this->ai_status_text = "AI failed: no legal fallback move";
-                                this->ai_used_fallback = true;
-                            }
-                        }
-
-                        if (this->board.getStatus() != gomoku::GameStatus::PLAYING)
-                            this->active_index = 3;
-                    }
-
-                    return true;
+                    } else { ai_status_text = "AI failed: no legal fallback move"; ai_used_fallback = true; }
                 }
-            }
 
-            return false;
+                if (board.getStatus() != gomoku::GameStatus::PLAYING) active_index = 3;
+            }
+            return true;
         };
-
-        return comp;
-    }
-
-    Component Controller::RenderGameBoard() {
-        auto comp = std::make_shared<InteractiveBoard>();
-
-        comp->renderLogic = [this]() -> Element {
-            return RenderGrid();
-        };
-
-        comp->eventLogic = [this](const Event& event) -> bool {
-            if (event == Event::ArrowUp) {
-                this->current_y = std::max(0, this->current_y - 1);
-                return true;
-            }
-            if (event == Event::ArrowDown) {
-                this->current_y = std::min(kBoardSize - 1, this->current_y + 1);
-                return true;
-            }
-            if (event == Event::ArrowLeft) {
-                this->current_x = std::max(0, this->current_x - 1);
-                return true;
-            }
-            if (event == Event::ArrowRight) {
-                this->current_x = std::min(kBoardSize - 1, this->current_x + 1);
-                return true;
-            }
-
-            if (event == Event::Return || event == Event::Character(' ')) {
-                if (this->board.placeStone(this->current_x, this->current_y)) {
-                    if (this->board.getStatus() != gomoku::GameStatus::PLAYING)
-                        this->active_index = 3;
-                    return true;
-                }
-            }
-
-            return false;
-        };
-
         return comp;
     }
 
     Component Controller::RenderEndPage() {
+        auto reset = [this](int next_index) {
+            active_index   = next_index;
+            board          = gomoku::Board(kBoardSize);
+            current_x      = next_index == 0 ? 0 : kBoardSize / 2;
+            current_y      = next_index == 0 ? 0 : kBoardSize / 2;
+            ai_status_text = "AI: ready";
+            ai_used_fallback = false;
+        };
         auto container = Container::Vertical({
-            Button("Back to menu", [this] {
-                this->active_index = 0;
-                this->board = gomoku::Board(kBoardSize);
-                this->current_x = 0;
-                this->current_y = 0;
-                this->ai_status_text = "AI: ready";
-                this->ai_used_fallback = false;
-            }),
-            Button("Play again", [this] {
-                this->active_index = 1;
-                this->board = gomoku::Board(kBoardSize);
-                this->current_x = kBoardSize / 2;
-                this->current_y = kBoardSize / 2;
-                this->ai_status_text = "AI: ready";
-                this->ai_used_fallback = false;
-            })
+            Button("Back to menu", [reset] { reset(0); }),
+            Button("Play again",   [reset] { reset(1); })
         });
-
         return Renderer(container, [container, this] {
-            std::string result_text = "Draw";
-            if (const gomoku::GameStatus status = this->board.getStatus(); status == gomoku::GameStatus::BLACK_WIN)
-                result_text = "Black win";
-            else if (status == gomoku::GameStatus::WHITE_WIN)
-                result_text = "White win";
-            else if (status == gomoku::GameStatus::PLAYING)
-                result_text = "Playing";
-
+            auto status = board.getStatus();
+            std::string result =
+                status == gomoku::GameStatus::BLACK_WIN ? "Black win" :
+                status == gomoku::GameStatus::WHITE_WIN ? "White win" :
+                status == gomoku::GameStatus::PLAYING   ? "Playing"   : "Draw";
             return vbox({
                 text("Game Over") | hcenter | bold | color(Color::Red),
                 separator(),
-                text("Result: " + result_text) | hcenter | color(Color::Yellow),
+                text("Result: " + result) | hcenter | color(Color::Yellow),
                 separator(),
                 container->Render() | hcenter
             }) | border | center;
@@ -726,48 +411,33 @@ namespace UI {
     }
 
     Element Controller::RenderGrid() const {
-        const gomoku::Stone current = board.getCurrentPlayer();
-        const std::string turn_text = (current == gomoku::Stone::BLACK)
-            ? "Current player: Black"
-            : "Current player: White";
-        const Color turn_color = (current == gomoku::Stone::BLACK) ? Color::Red : Color::White;
+        auto cur   = board.getCurrentPlayer();
+        bool black = cur == gomoku::Stone::BLACK;
+        auto status_bar = text(black ? "Current player: Black" : "Current player: White")
+                          | bold | color(black ? Color::Red : Color::White) | hcenter;
 
-        auto status_bar = text(turn_text) | bold | color(turn_color) | hcenter;
-        auto ai_bar = text(this->ai_status_text) | hcenter;
-        if (this->active_index == 2) {
-            ai_bar |= this->ai_used_fallback ? color(Color::Yellow) : color(Color::Green);
-        } else {
+        auto ai_bar = text(ai_status_text) | hcenter;
+        if (active_index == 2)
+            ai_bar |= ai_used_fallback ? color(Color::Yellow) : color(Color::Green);
+        else
             ai_bar |= dim;
-        }
-        Elements rows;
 
+        Elements rows;
         for (int y = 0; y < kBoardSize; ++y) {
             Elements cols;
             for (int x = 0; x < kBoardSize; ++x) {
                 const auto stone = board.getStone(x, y);
-                const std::string cell = (stone == gomoku::Stone::EMPTY) ? " + "
-                    : (stone == gomoku::Stone::BLACK) ? " ○ " : " ● ";
-
-                auto element = text(cell);
-                if (x == current_x && y == current_y) {
-                    element |= bgcolor(Color::Blue) | color(Color::White);
-                } else if (stone == gomoku::Stone::BLACK) {
-                    element |= color(Color::Red);
-                } else if (stone == gomoku::Stone::WHITE) {
-                    element |= color(Color::White);
-                }
-                cols.push_back(element);
+                std::string cell = stone == gomoku::Stone::EMPTY ? " + "
+                                 : stone == gomoku::Stone::BLACK ? " ○ " : " ● ";
+                auto el = text(cell);
+                if (x == current_x && y == current_y) el |= bgcolor(Color::Blue) | color(Color::White);
+                else if (stone == gomoku::Stone::BLACK) el |= color(Color::Red);
+                else if (stone == gomoku::Stone::WHITE) el |= color(Color::White);
+                cols.push_back(el);
             }
             rows.push_back(hbox(std::move(cols)));
         }
 
-        auto board_ui = vbox(std::move(rows)) | hcenter;
-
-        return vbox({
-            status_bar,
-            ai_bar,
-            separator(),
-            board_ui
-        }) | border | center;
+        return vbox({status_bar, ai_bar, separator(), vbox(std::move(rows)) | hcenter}) | border | center;
     }
 }

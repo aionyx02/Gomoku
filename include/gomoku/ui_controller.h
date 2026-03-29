@@ -1,5 +1,5 @@
 /**
- * @file ui_controller.h
+* @file ui_controller.h
  * @author shawn
  * @date 2026/3/22
  * @brief Terminal UI controller for Gomoku.
@@ -15,6 +15,7 @@
 namespace ftxui {
     class ComponentBase;
     class Node;
+    class Event;
     using Component = std::shared_ptr<ComponentBase>;
     using Element = std::shared_ptr<Node>;
 }
@@ -41,9 +42,10 @@ namespace UI {
         bool ai_used_fallback = false;
 
         ftxui::Component RenderFrontPage();
-        ftxui::Component RenderGameBoard();
-        ftxui::Component RenderGameAIBoard();
+        ftxui::Component RenderGameBoard(bool has_ai);
         ftxui::Component RenderEndPage();
+
+        bool HandleMove(const ftxui::Event& event);
 
         [[nodiscard]] ftxui::Element RenderGrid() const;
     };
