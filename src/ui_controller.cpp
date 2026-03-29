@@ -40,14 +40,14 @@ namespace UI {
 
         std::string QuoteArg(const std::string& s) {
             std::string out = "\"";
-            for (char ch : s) { if (ch == '"') out += "\\\""; else out += ch; }
+            for (const char ch : s) { if (ch == '"') out += "\\\""; else out += ch; }
             return out + "\"";
         }
 
-        std::string CompactMessage(const std::string& text, size_t max_len = 140) {
+        std::string CompactMessage(const std::string& text, const size_t max_len = 140) {
             std::string out;
             bool sp = false;
-            for (unsigned char ch : text) {
+            for (const char ch : text) {
                 if (std::isspace(ch)) { if (!sp && !out.empty()) out += ' '; sp = true; }
                 else { out += ch; sp = false; }
             }
@@ -59,7 +59,7 @@ namespace UI {
         fs::path ExeDir() {
 #if defined(_WIN32)
             std::array<char, 4096> buf{};
-            if (DWORD n = GetModuleFileNameA(nullptr, buf.data(), (DWORD)buf.size()); n > 0 && n < buf.size())
+            if (const DWORD n = GetModuleFileNameA(nullptr, buf.data(), (DWORD)buf.size()); n > 0 && n < buf.size())
                 return fs::path(std::string(buf.data(), n)).parent_path();
 #endif
             std::error_code ec;
@@ -71,11 +71,11 @@ namespace UI {
             auto add = [&](fs::path p) {
                 std::error_code ec;
                 p = fs::absolute(p, ec).lexically_normal();
-                std::string key = p.generic_string();
+                const std::string key = p.generic_string();
                 for (auto& x : out) if (x.generic_string() == key) return;
                 out.push_back(p);
             };
-            fs::path exe = ExeDir();
+            const fs::path exe = ExeDir();
             add(fs::path(kSourceDir));
             add(exe);
             add(exe.parent_path());
@@ -105,13 +105,12 @@ namespace UI {
                 // strip surrounding quotes
                 if (cmd.size() >= 2 && cmd.front() == '"' && cmd.back() == '"')
                     cmd = cmd.substr(1, cmd.size() - 2);
-                // normalise key
+                // normalize key
                 std::string key = cmd;
-                for (auto& c : key) c = (char)std::tolower((unsigned char)c);
+                for (auto& c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 if (std::ranges::find(seen, key) != seen.end()) return;
                 seen.push_back(key);
-                bool is_path = cmd.find_first_of("/\\:") != std::string::npos;
-                if (is_path) {
+                if (cmd.find_first_of("/\\:") != std::string::npos) {
                     if (std::error_code ec; !fs::exists(cmd, ec)) return;
                     cmd = fs::path(cmd).lexically_normal().generic_string();
                 }
@@ -162,18 +161,18 @@ namespace UI {
             WaitForSingleObject(pi.hProcess, INFINITE);
             DWORD ec = 1; GetExitCodeProcess(pi.hProcess, &ec);
             CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-            return (int)ec;
+            return static_cast<int>(ec);
         }
 #endif
 
         // ── board helpers ────────────────────────────────────────────────────
 
-        char StoneChar(gomoku::Stone s) {
+        char StoneChar(const gomoku::Stone s) {
             return s == gomoku::Stone::BLACK ? 'B' : s == gomoku::Stone::WHITE ? 'W' : '.';
         }
 
         std::string SerializeBoard(const gomoku::Board& b) {
-            int sz = b.getSize();
+            const int sz = b.getSize();
             std::string out; out.reserve(sz * sz);
             for (int y = 0; y < sz; ++y)
                 for (int x = 0; x < sz; ++x)
@@ -185,8 +184,8 @@ namespace UI {
             std::istringstream ss(output); std::string line;
             std::optional<std::pair<int,int>> result;
             while (std::getline(ss, line)) {
-                std::istringstream ls(line); int x, y; std::string extra;
-                if ((ls >> x >> y) && !(ls >> extra)) result = {x, y};
+                std::istringstream ls(line); int y; std::string extra;
+                if (int x; (ls >> x >> y) && !(ls >> extra)) result = {x, y};
             }
             return result;
         }
@@ -244,8 +243,7 @@ namespace UI {
                 if (!move) return {std::nullopt, "cannot parse AI move (py=" + py + "): " + CompactMessage(output)};
 
                 auto [x, y] = *move;
-                int sz = board.getSize();
-                if (x < 0 || x >= sz || y < 0 || y >= sz)
+                if (int sz = board.getSize(); x < 0 || x >= sz || y < 0 || y >= sz)
                     return {std::nullopt, "AI move out of range: (" + std::to_string(x) + "," + std::to_string(y) + ")"};
 
                 return {std::make_pair(x, y), ""};
@@ -260,7 +258,7 @@ namespace UI {
         }
 
         std::optional<std::pair<int,int>> FallbackMove(const gomoku::Board& b) {
-            int sz = b.getSize();
+            const int sz = b.getSize();
             for (int y = 0; y < sz; ++y)
                 for (int x = 0; x < sz; ++x)
                     if (b.getStone(x, y) == gomoku::Stone::EMPTY) return {{x, y}};
@@ -275,8 +273,8 @@ namespace UI {
         std::function<Element()>    renderLogic;
         std::function<bool(Event)>  eventLogic;
         Element OnRender() override { return renderLogic(); }
-        bool Focusable() const override { return true; }
-        bool OnEvent(Event e) override { return eventLogic(e); }
+        [[nodiscard]] bool Focusable() const override { return true; }
+        bool OnEvent(const Event e) override { return eventLogic(e); }
     };
 
     // ── Controller ───────────────────────────────────────────────────────────
@@ -291,7 +289,7 @@ namespace UI {
     Controller::~Controller() = default;
 
     void Controller::Start() {
-        auto container = Container::Tab({
+        const auto container = Container::Tab({
             RenderFrontPage(),
             RenderGameBoard(/*has_ai=*/false),
             RenderGameBoard(/*has_ai=*/true),
@@ -354,8 +352,7 @@ namespace UI {
                 std::string fallback_reason = "unknown AI error";
 
                 if (auto [move, reason] = QueryAIMove(board); move) {
-                    auto [ax, ay] = *move;
-                    if ((placed = board.placeStone(ax, ay))) {
+                    if (auto [ax, ay] = *move; (placed = board.placeStone(ax, ay))) {
                         current_x = ax; current_y = ay;
                         ai_status_text = "AI(model): move (" + std::to_string(ax) + "," + std::to_string(ay) + ")";
                         ai_used_fallback = false;
@@ -364,8 +361,7 @@ namespace UI {
 
                 if (!placed) {
                     if (auto fb = FallbackMove(board)) {
-                        auto [fx, fy] = *fb;
-                        if (board.placeStone(fx, fy)) {
+                        if (auto [fx, fy] = *fb; board.placeStone(fx, fy)) {
                             current_x = fx; current_y = fy;
                             ai_status_text = "AI(fallback): move (" + std::to_string(fx) + "," + std::to_string(fy)
                                              + ") | reason: " + fallback_reason;
@@ -382,7 +378,7 @@ namespace UI {
     }
 
     Component Controller::RenderEndPage() {
-        auto reset = [this](int next_index) {
+        auto reset = [this](const int next_index) {
             active_index   = next_index;
             board          = gomoku::Board(kBoardSize);
             current_x      = next_index == 0 ? 0 : kBoardSize / 2;
@@ -395,8 +391,8 @@ namespace UI {
             Button("Play again",   [reset] { reset(1); })
         });
         return Renderer(container, [container, this] {
-            auto status = board.getStatus();
-            std::string result =
+            const auto status = board.getStatus();
+            const std::string result =
                 status == gomoku::GameStatus::BLACK_WIN ? "Black win" :
                 status == gomoku::GameStatus::WHITE_WIN ? "White win" :
                 status == gomoku::GameStatus::PLAYING   ? "Playing"   : "Draw";
@@ -411,8 +407,8 @@ namespace UI {
     }
 
     Element Controller::RenderGrid() const {
-        auto cur   = board.getCurrentPlayer();
-        bool black = cur == gomoku::Stone::BLACK;
+        const auto cur   = board.getCurrentPlayer();
+        const bool black = cur == gomoku::Stone::BLACK;
         auto status_bar = text(black ? "Current player: Black" : "Current player: White")
                           | bold | color(black ? Color::Red : Color::White) | hcenter;
 
@@ -427,7 +423,7 @@ namespace UI {
             Elements cols;
             for (int x = 0; x < kBoardSize; ++x) {
                 const auto stone = board.getStone(x, y);
-                std::string cell = stone == gomoku::Stone::EMPTY ? " + "
+                const std::string cell = stone == gomoku::Stone::EMPTY ? " + "
                                  : stone == gomoku::Stone::BLACK ? " ○ " : " ● ";
                 auto el = text(cell);
                 if (x == current_x && y == current_y) el |= bgcolor(Color::Blue) | color(Color::White);
