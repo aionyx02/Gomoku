@@ -244,16 +244,17 @@ namespace UI {
 
             HANDLE read_pipe = nullptr;
             HANDLE write_pipe = nullptr;
+
             if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0)) {
-                if (startup_error != nullptr)
-                    *startup_error = "CreatePipe failed";
+                // if (startup_error != nullptr)
+                //     *startup_error = "CreatePipe failed";
                 return -1;
             }
             if (!SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0)) {
                 CloseHandle(read_pipe);
                 CloseHandle(write_pipe);
-                if (startup_error != nullptr)
-                    *startup_error = "SetHandleInformation failed";
+                // if (startup_error != nullptr)
+                //     *startup_error = "SetHandleInformation failed";
                 return -1;
             }
 
@@ -282,15 +283,15 @@ namespace UI {
             );
 
             CloseHandle(write_pipe);
-
-            if (!ok) {
-                CloseHandle(read_pipe);
-                if (startup_error != nullptr) {
-                    const DWORD error = GetLastError();
-                    *startup_error = "CreateProcess failed (" + std::to_string(error) + ")";
-                }
-                return -1;
-            }
+            //
+            // if (!ok) {
+            //     CloseHandle(read_pipe);
+            //     if (startup_error != nullptr) {
+            //         const DWORD error = GetLastError();
+            //         *startup_error = "CreateProcess failed (" + std::to_string(error) + ")";
+            //     }
+            //     return -1;
+            // }
 
             std::array<char, 4096> buffer {};
             DWORD bytes_read = 0;
