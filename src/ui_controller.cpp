@@ -74,22 +74,20 @@ std::string gameResultText(const gomoku::GameStatus status) {
     }
 }
 
-Element framedStoneCell(const std::string& symbol, const Color frame_color, const Color symbol_color) {
+Element framedStoneCell(const std::string& symbol, const Color symbol_color) {
     return hbox({
-        text(" "),
-        text("") | color(frame_color) | bold,
+        text("  "),
         text(symbol) | color(symbol_color) | bold,
-        text(" ") | color(frame_color) | bold,
         text(" ")
     }) | size(WIDTH, EQUAL, 5) | hcenter;
 }
 
 Element stoneCellElement(const gomoku::Stone stone) {
     switch (stone) {
-        case gomoku::Stone::BLACK:
-            return framedStoneCell("●", Color::Red, Color::White);
         case gomoku::Stone::WHITE:
-            return framedStoneCell("○", Color::Blue, Color::White);
+            return framedStoneCell("●", Color::White);
+        case gomoku::Stone::BLACK:
+            return framedStoneCell("○", Color::Red);
         case gomoku::Stone::EMPTY:
         default:
             return text("  +  ") | color(Color::GrayDark) | size(WIDTH, EQUAL, 5) | hcenter;

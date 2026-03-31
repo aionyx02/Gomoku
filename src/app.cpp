@@ -17,7 +17,7 @@ using namespace gomoku;
 
 int main() {
     gomoku::Board board(15);
-    UI::Controller controller(board);
+    const UI::Controller controller(board);
 
     controller.Start();
 
