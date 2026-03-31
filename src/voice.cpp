@@ -35,7 +35,7 @@ bool voice::initAudioSystem() {
 
     result = ma_sound_init_from_file(&engine,"../voice/backGround.mp3", MA_SOUND_FLAG_STREAM, nullptr, nullptr, &g_bgm);
 
-    if (result != MA_SUCCESS) {
+    if (result == MA_SUCCESS) {
         ma_sound_set_looping(&g_bgm, true);
     }
     g_isInitalized = true;

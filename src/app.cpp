@@ -32,6 +32,7 @@ int main() {
     gomoku::GameSession session(15, kSourceDir, kPythonExecutable);
     const UI::Controller controller(session);
 
+    gameVoice.initAudioSystem();
     gameVoice.backGroundMusic();
 
     controller.Start();

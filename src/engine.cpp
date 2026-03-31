@@ -12,6 +12,7 @@
  *   is an O(N) memory block copy (where N = 225), highly optimized for tree search.
  */
 #include "gomoku/engine.h"
+#include "gomoku/voice.h"
 
 namespace gomoku {
 
@@ -50,6 +51,7 @@ namespace gomoku {
             }
         }
 
+        gameVoice.placeStoneSound();
         return true;
     }
 
