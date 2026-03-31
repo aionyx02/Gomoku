@@ -77,9 +77,9 @@ std::string gameResultText(const gomoku::GameStatus status) {
 Element framedStoneCell(const std::string& symbol, const Color frame_color, const Color symbol_color) {
     return hbox({
         text(" "),
-        text("[") | color(frame_color) | bold,
+        text("") | color(frame_color) | bold,
         text(symbol) | color(symbol_color) | bold,
-        text("]") | color(frame_color) | bold,
+        text(" ") | color(frame_color) | bold,
         text(" ")
     }) | size(WIDTH, EQUAL, 5) | hcenter;
 }
@@ -184,15 +184,15 @@ struct Controller::Impl {
     }
 
     bool runAiTurn() {
-        const auto result = ai_player.makeMove(board);
-        ai_used_fallback = result.used_fallback;
+        const auto [move, used_fallback, diagnostic] = ai_player.makeMove(board);
+        ai_used_fallback = used_fallback;
 
-        if (!result.move) {
-            ai_status_text = "AI failed: " + result.diagnostic;
+        if (!move) {
+            ai_status_text = "AI failed: " + diagnostic;
             return false;
         }
 
-        const auto [x, y] = *result.move;
+        const auto [x, y] = *move;
         if (!board.placeStone(x, y)) {
             ai_status_text = "AI failed: suggested move is invalid";
             ai_used_fallback = true;
@@ -201,12 +201,12 @@ struct Controller::Impl {
 
         current_x = x;
         current_y = y;
-        ai_status_text = result.used_fallback
+        ai_status_text = used_fallback
             ? "AI(fallback): move (" + std::to_string(x) + "," + std::to_string(y) + ")"
             : "AI(model): move (" + std::to_string(x) + "," + std::to_string(y) + ")";
 
-        if (result.used_fallback && !result.diagnostic.empty()) {
-            ai_status_text += " | reason: " + result.diagnostic;
+        if (used_fallback && !diagnostic.empty()) {
+            ai_status_text += " | reason: " + diagnostic;
         }
 
         tryMoveToResult();
