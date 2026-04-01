@@ -10,3 +10,5 @@
  * - Resource Impact: 
  */
 #include "gomoku/webConnect.h"
+
+//ftxui app + ttyd + cloudflare tunnel + cloudflare access

@@ -118,6 +118,16 @@ std::string searchedPaths(const std::vector<fs::path>& bases, const std::string&
     return output;
 }
 
+void writeDebugLog(const std::string& source_dir, const std::string& content) {
+    std::error_code ec;
+    fs::path debug_log_path = fs::path(source_dir) / "ai_debug.log";
+    debug_log_path = fs::absolute(debug_log_path, ec).lexically_normal();
+    if (FILE* file = fopen(debug_log_path.string().c_str(), "w")) {
+        fputs(content.c_str(), file);
+        fclose(file);
+    }
+}
+
 std::vector<std::string> pythonCommands(const std::vector<fs::path>& bases, std::string preferred_python) {
     std::vector<std::string> commands;
     std::vector<std::string> seen;
@@ -281,26 +291,55 @@ RawModelResult queryModelMove(const gomoku::Board& board,
         }
     }
     if (!script) {
+        const std::string reason =
+            "runModelAndReturnPoint.py not found in expected paths: python/inference, python, project root";
+        writeDebugLog(source_dir, reason + "\n");
         return {
             std::nullopt,
-            "runModelAndReturnPoint.py not found in expected paths: python/inference, python, project root"
+            reason
         };
     }
 
+    static constexpr std::array kModelCandidates = {
+        "best.pt",
+        "python/models/az_prompt_smoke/best.pt",
+        "python/models/az_prompt_smoke/gomoku_model.pt",
+        "python/models/az_prompt_smoke/publish.pt",
+        "python/models/alphazero/best.pt",
+        "python/models/alphazero/gomoku_alphazero_best.pt",
+        "python/models/alphazero_bootstrap/gomoku_alphazero_bootstrap.pt",
+        "gomoku_model.pt",
+        "gomoku_model.pt.bak",
+        "python/models/gomoku_model.pt"
+    };
+
     std::optional<fs::path> model;
-    for (const auto* candidate : {
-             "gomoku_model.pt",
-             "python/models/gomoku_model.pt"
-         }) {
+    for (const auto* candidate : kModelCandidates) {
         model = findFile(bases, candidate);
         if (model) {
             break;
         }
     }
     if (!model) {
+        std::string searched_summary;
+        std::string debug_detail = "[model-search]\n";
+        for (const auto* candidate : kModelCandidates) {
+            if (!searched_summary.empty()) {
+                searched_summary += " || ";
+            }
+            searched_summary += compactMessage(searchedPaths(bases, candidate), 220);
+            debug_detail += "[candidate] ";
+            debug_detail += candidate;
+            debug_detail += "\n";
+            debug_detail += searchedPaths(bases, candidate);
+            debug_detail += "\n";
+        }
+        const std::string reason =
+            "no model checkpoint found; searched: " + compactMessage(searched_summary, 1200);
+        writeDebugLog(source_dir, debug_detail + "\n[reason] " + reason + "\n");
         return {
             std::nullopt,
-            "gomoku_model.pt not found; searched: " + compactMessage(searchedPaths(bases, "gomoku_model.pt"), 260)
+            reason
         };
     }
 
@@ -319,9 +358,13 @@ RawModelResult queryModelMove(const gomoku::Board& board,
 
     std::vector<std::string> logs;
     logs.reserve(candidates.size());
+    std::string debug_log;
 
     for (const auto& python : candidates) {
         std::string output;
+        debug_log += "[try] py=" + python +
+                     " script=" + script->generic_string() +
+                     " model=" + model->generic_string() + "\n";
 #if defined(_WIN32)
         const std::string command =
             quoteArg(python) + " " + quoteArg(script->generic_string()) + " " + args;
@@ -343,11 +386,22 @@ RawModelResult queryModelMove(const gomoku::Board& board,
 
         if (rc != 0) {
             logs.push_back("py=" + python + " exit=" + std::to_string(rc) + ": " + compactMessage(output));
+            debug_log += "exit=" + std::to_string(rc) + "\n";
+            if (output.empty()) {
+                debug_log += "(no output)\n";
+            } else {
+                debug_log += output;
+                if (output.back() != '\n') {
+                    debug_log += "\n";
+                }
+            }
+            debug_log += "\n";
             continue;
         }
 
         const auto parsed = parseMove(output);
         if (!parsed) {
+            writeDebugLog(source_dir, debug_log + "[parse-error]\n" + output + "\n");
             return {
                 std::nullopt,
                 "cannot parse AI move (py=" + python + "): " + compactMessage(output)
@@ -356,6 +410,7 @@ RawModelResult queryModelMove(const gomoku::Board& board,
 
         const auto [x, y] = *parsed;
         if (const int size = board.getSize(); x < 0 || x >= size || y < 0 || y >= size) {
+            writeDebugLog(source_dir, debug_log + "[range-error] output:\n" + output + "\n");
             return {
                 std::nullopt,
                 "AI move out of range: (" + std::to_string(x) + "," + std::to_string(y) + ")"
@@ -363,6 +418,7 @@ RawModelResult queryModelMove(const gomoku::Board& board,
         }
 
         if (board.getStone(x, y) != gomoku::Stone::EMPTY) {
+            writeDebugLog(source_dir, debug_log + "[occupied-error] output:\n" + output + "\n");
             return {
                 std::nullopt,
                 "AI move is not empty: (" + std::to_string(x) + "," + std::to_string(y) + ")"
@@ -380,11 +436,7 @@ RawModelResult queryModelMove(const gomoku::Board& board,
         summary += entry;
     }
 
-    const fs::path debug_log_path = fs::path(source_dir) / "ai_debug.log";
-    if (FILE* file = fopen(debug_log_path.string().c_str(), "w")) {
-        fprintf(file, "%s\n", summary.c_str());
-        fclose(file);
-    }
+    writeDebugLog(source_dir, debug_log + "[summary] " + summary + "\n");
 
     return {
         std::nullopt,

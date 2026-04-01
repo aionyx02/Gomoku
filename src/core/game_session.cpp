@@ -26,7 +26,7 @@ void GameSession::reset() {
     ai_used_fallback_ = false;
 
     if (mode_ == SessionMode::PVE) {
-        ai_status_text_ = "AI: ready (model expected at gomoku_model.pt)";
+        ai_status_text_ = "AI: ready (model expected at python/models/az_prompt_smoke/gomoku_model.pt)";
     } else {
         ai_status_text_ = "AI: disabled in PvP";
     }
