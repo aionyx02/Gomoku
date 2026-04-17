@@ -26,7 +26,8 @@ class GameSession {
 public:
     explicit GameSession(int board_size = 15,
                          std::string source_dir = ".",
-                         std::string preferred_python = "python");
+                         std::string preferred_python = "python",
+                         std::string saves_dir = "");
 
     void start(SessionMode next_mode);
     void reset();
@@ -44,6 +45,12 @@ public:
 
     bool undo();
 
+    // Returns the path to the saved file, or empty string on failure.
+    std::string serialize() const;
+    bool deserialize(const std::string& filepath);
+
+    [[nodiscard]] const std::string& saves_dir() const;
+
 private:
     int board_size_ = 15;
     SessionMode mode_ = SessionMode::PVP;
@@ -53,6 +60,7 @@ private:
     bool ai_used_fallback_ = false;
     std::optional<std::pair<int, int>> last_move_;
     std::vector<std::pair<int, int>> move_history_;
+    std::string saves_dir_;
 };
 
 } // namespace gomoku

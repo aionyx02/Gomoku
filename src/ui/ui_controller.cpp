@@ -7,6 +7,7 @@
 #include "ftxui/dom/elements.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -23,6 +24,7 @@ constexpr int kPvpTab = 1;
 constexpr int kPveTab = 2;
 constexpr int kResultTab = 3;
 constexpr int kSettingsTab = 4;
+constexpr int kLoadTab = 5;
 
 class InteractiveBoard final : public ComponentBase {
 public:
@@ -95,7 +97,8 @@ struct Controller::Impl {
             renderGameBoard(false),
             renderGameBoard(true),
             renderEndPage(),
-            renderSettingsPage()
+            renderSettingsPage(),
+            renderLoadGamePage()
         }, &active_index);
 
         screen_state->screen.Loop(container);
@@ -127,6 +130,121 @@ struct Controller::Impl {
         active_index = kMenuTab;
         current_x = 0;
         current_y = 0;
+    }
+
+    void refreshSavesList() {
+        namespace fs = std::filesystem;
+        save_files_.clear();
+        load_selected_ = 0;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(session.saves_dir(), ec)) {
+            if (entry.path().extension() == ".gomoku") {
+                save_files_.push_back(entry.path().string());
+            }
+        }
+        std::sort(save_files_.begin(), save_files_.end(), std::greater<>());
+    }
+
+    Component renderLoadGamePage() {
+        auto component = std::make_shared<InteractiveBoard>();
+
+        component->render_logic = [this] {
+            if (save_files_.empty()) {
+                return vbox({
+                    text("Load Game") | hcenter | bold | color(Color::Cyan),
+                    separator(),
+                    text("No saves found in: " + session.saves_dir()) | dim | hcenter,
+                    separator(),
+                    text("Esc  Back to menu") | dim | hcenter
+                }) | border | center;
+            }
+
+            Elements items;
+            for (int i = 0; i < static_cast<int>(save_files_.size()); ++i) {
+                namespace fs = std::filesystem;
+                auto label = fs::path(save_files_[i]).stem().string();
+                auto item = text("  " + label + "  ");
+                if (i == load_selected_) item |= inverted;
+                items.push_back(item);
+            }
+
+            return vbox({
+                text("Load Game") | hcenter | bold | color(Color::Cyan),
+                separator(),
+                vbox(std::move(items)),
+                separator(),
+                text("↑↓ Select  Enter Load  Esc Back") | dim | hcenter
+            }) | border | center;
+        };
+
+        component->event_logic = [this](const Event& event) {
+            if (event == Event::Escape) {
+                active_index = kMenuTab;
+                return true;
+            }
+            if (event == Event::ArrowUp) {
+                if (!save_files_.empty())
+                    load_selected_ = std::max(0, load_selected_ - 1);
+                return true;
+            }
+            if (event == Event::ArrowDown) {
+                if (!save_files_.empty())
+                    load_selected_ = std::min(static_cast<int>(save_files_.size()) - 1, load_selected_ + 1);
+                return true;
+            }
+            if (event == Event::Return && !save_files_.empty()) {
+                if (session.deserialize(save_files_[load_selected_])) {
+                    centerCursor();
+                    active_index = (session.mode() == gomoku::SessionMode::PVE) ? kPveTab : kPvpTab;
+                    if (session.status() != gomoku::GameStatus::PLAYING) {
+                        active_index = kResultTab;
+                    }
+                }
+                return true;
+            }
+            return false;
+        };
+
+        return component;
+    }
+
+    bool handleSaveMenuEvent(const Event& event) {
+        constexpr int kSaveMenuItems = 4;
+
+        if (event == Event::ArrowUp) {
+            save_menu_selected_ = (save_menu_selected_ + kSaveMenuItems - 1) % kSaveMenuItems;
+            return true;
+        }
+        if (event == Event::ArrowDown) {
+            save_menu_selected_ = (save_menu_selected_ + 1) % kSaveMenuItems;
+            return true;
+        }
+        if (event == Event::Escape) {
+            show_save_menu_ = false;
+            return true;
+        }
+        if (event == Event::Return) {
+            switch (save_menu_selected_) {
+                case 0: // Save & Leave
+                    session.serialize();
+                    show_save_menu_ = false;
+                    backToMenu();
+                    break;
+                case 1: // Save
+                    session.serialize();
+                    show_save_menu_ = false;
+                    break;
+                case 2: // Leave
+                    show_save_menu_ = false;
+                    backToMenu();
+                    break;
+                case 3: // Cancel
+                    show_save_menu_ = false;
+                    break;
+            }
+            return true;
+        }
+        return true; // absorb all keys while submenu is open
     }
 
     bool handleCursorMove(const Event& event) {
@@ -202,6 +320,11 @@ struct Controller::Impl {
                 return true;
             }
             if (menu_selected == 3) {
+                refreshSavesList();
+                active_index = kLoadTab;
+                return true;
+            }
+            if (menu_selected == 4) {
                 screen_state->screen.Exit();
                 return true;
             }
@@ -216,7 +339,17 @@ struct Controller::Impl {
         auto component = std::make_shared<InteractiveBoard>();
         component->render_logic = [this] { return renderGrid(); };
         component->event_logic = [this, has_ai](const Event& event) {
+            if (show_save_menu_) {
+                return handleSaveMenuEvent(event);
+            }
+
             if (handleCursorMove(event)) {
+                return true;
+            }
+
+            if (event == Event::Character('l') || event == Event::Character('L')) {
+                show_save_menu_ = true;
+                save_menu_selected_ = 0;
                 return true;
             }
 
@@ -347,7 +480,7 @@ struct Controller::Impl {
             text(" [Save/Leave(L)] ") | bold,
         });
 
-        return vbox({
+        auto board_element = vbox({
             status_bar,
             ai_bar,
             separator(),
@@ -355,6 +488,36 @@ struct Controller::Impl {
             separator(),
             bottom_bar
         }) | border | center;
+
+        if (!show_save_menu_) {
+            return board_element;
+        }
+
+        const std::vector<std::string> save_menu_labels = {
+            "Save & Leave",
+            "Save",
+            "Leave",
+            "Cancel"
+        };
+
+        Elements menu_items;
+        for (int i = 0; i < static_cast<int>(save_menu_labels.size()); ++i) {
+            auto item = text("  " + save_menu_labels[i] + "  ");
+            if (i == save_menu_selected_) {
+                item |= inverted;
+            }
+            menu_items.push_back(item);
+        }
+
+        auto overlay = vbox({
+            text("Save / Leave") | hcenter | bold | color(Color::Cyan),
+            separator(),
+            vbox(std::move(menu_items)),
+            separator(),
+            text("↑↓ Move  Enter Confirm  Esc Cancel") | dim | hcenter
+        }) | border | bgcolor(Color::Black) | center;
+
+        return dbox({ board_element, overlay | center });
     }
 
     gomoku::GameSession& session;
@@ -364,6 +527,7 @@ struct Controller::Impl {
         "Start Game (PvP)",
         "Start Game (PvE)",
         "Settings",
+        "Load Game",
         "Exit"
     };
 
@@ -376,6 +540,14 @@ struct Controller::Impl {
     // Settings state (wired up in Phase C / Phase F)
     bool settings_undo_enabled  = true;
     bool settings_timer_enabled = false;
+
+    // Save/Leave submenu state
+    bool show_save_menu_     = false;
+    int  save_menu_selected_ = 0;
+
+    // Load Game page state
+    std::vector<std::string> save_files_;
+    int load_selected_ = 0;
 };
 
 Controller::Controller(gomoku::GameSession& session)
