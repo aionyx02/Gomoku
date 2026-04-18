@@ -191,6 +191,10 @@ bool GameSession::deserialize(const std::string& filepath) {
     return true;
 }
 
+bool GameSession::skipTurn() {
+    return board_.skipTurn();
+}
+
 bool GameSession::undo() {
     if (move_history_.empty()) return false;
 

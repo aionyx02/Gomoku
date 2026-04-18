@@ -44,6 +44,7 @@ public:
     [[nodiscard]] const std::vector<std::pair<int, int>>& move_history() const;
 
     bool undo();
+    bool skipTurn();
 
     // Returns the path to the saved file, or empty string on failure.
     std::string serialize() const;

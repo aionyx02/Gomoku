@@ -38,6 +38,9 @@ namespace gomoku {
         // Remove the stone at (x,y) and restore turn/status to PLAYING.
         bool undoStone(int x, int y);
 
+        // Forfeit the current player's turn (no stone placed).
+        bool skipTurn();
+
         [[nodiscard]] Stone getStone(int x, int y) const;
         [[nodiscard]] Stone getCurrentPlayer() const;
         [[nodiscard]] GameStatus getStatus() const;

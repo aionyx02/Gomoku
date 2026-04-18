@@ -98,6 +98,7 @@ struct Controller::Impl {
 
     ~Impl() {
         stopReplayAuto();
+        stopTimer();
     }
 
     void Start() {
@@ -133,9 +134,15 @@ struct Controller::Impl {
         } else {
             active_index = kPvpTab;
         }
+
+        if (settings_timer_enabled) {
+            startTimer();
+        }
     }
 
     void backToMenu() {
+        stopTimer();
+        consecutive_timeouts_ = 0;
         session.reset();
         active_index = kMenuTab;
         current_x = 0;
@@ -164,6 +171,55 @@ struct Controller::Impl {
                 }
             }
         });
+    }
+
+    void stopTimer() {
+        timer_stop_.store(true);
+        if (timer_thread_.joinable()) {
+            timer_thread_.join();
+        }
+        timer_remaining_ = 0;
+    }
+
+    void startTimer() {
+        stopTimer();
+        int secs = 20;
+        try { secs = std::stoi(settings_timer_seconds_str_); } catch (...) {}
+        if (secs <= 0) secs = 20;
+        timer_remaining_ = secs;
+        timer_stop_.store(false);
+        timer_thread_ = std::thread([this] {
+            while (!timer_stop_.load()) {
+                for (int i = 0; i < 10 && !timer_stop_.load(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (!timer_stop_.load()) {
+                    screen_state->screen.PostEvent(Event::Special("timer_tick"));
+                }
+            }
+        });
+    }
+
+    void handleTimerTimeout(const bool has_ai) {
+        if (session.status() != gomoku::GameStatus::PLAYING) return;
+        session.skipTurn();
+        ++consecutive_timeouts_;
+
+        if (has_ai && session.status() == gomoku::GameStatus::PLAYING) {
+            runAiTurn();
+        }
+
+        if (consecutive_timeouts_ >= 3) {
+            consecutive_timeouts_ = 0;
+            stopTimer();
+            show_save_menu_ = true;
+            save_menu_selected_ = 0;
+            return;
+        }
+
+        if (settings_timer_enabled && session.status() == gomoku::GameStatus::PLAYING) {
+            startTimer();
+        }
     }
 
     void enterReplay() {
@@ -492,6 +548,19 @@ struct Controller::Impl {
         auto component = std::make_shared<InteractiveBoard>();
         component->render_logic = [this] { return renderGrid(); };
         component->event_logic = [this, has_ai](const Event& event) {
+            if (event == Event::Special("timer_tick")) {
+                if (settings_timer_enabled && !show_save_menu_ &&
+                    session.status() == gomoku::GameStatus::PLAYING) {
+                    if (timer_remaining_ > 0) {
+                        --timer_remaining_;
+                    }
+                    if (timer_remaining_ == 0) {
+                        handleTimerTimeout(has_ai);
+                    }
+                }
+                return true;
+            }
+
             if (show_save_menu_) {
                 return handleSaveMenuEvent(event);
             }
@@ -515,6 +584,10 @@ struct Controller::Impl {
             if (event == Event::Character('u') || event == Event::Character('U')) {
                 if (settings_undo_enabled) {
                     session.undo();
+                    if (settings_timer_enabled &&
+                        session.status() == gomoku::GameStatus::PLAYING) {
+                        startTimer();
+                    }
                 }
                 return true;
             }
@@ -527,9 +600,14 @@ struct Controller::Impl {
                 return false;
             }
 
+            consecutive_timeouts_ = 0;
+            stopTimer();
             tryMoveToResult();
             if (has_ai && session.status() == gomoku::GameStatus::PLAYING) {
                 runAiTurn();
+            }
+            if (settings_timer_enabled && session.status() == gomoku::GameStatus::PLAYING) {
+                startTimer();
             }
 
             return true;
@@ -550,6 +628,17 @@ struct Controller::Impl {
         auto undo_checkbox  = Checkbox("Undo", &settings_undo_enabled, cb_opt);
         auto timer_checkbox = Checkbox("Move Timer", &settings_timer_enabled, cb_opt);
 
+        InputOption inp_opt = InputOption::Default();
+        inp_opt.on_change = [this] {
+            std::string filtered;
+            for (const char c : settings_timer_seconds_str_) {
+                if (c >= '0' && c <= '9') filtered += c;
+            }
+            if (filtered.size() > 3) filtered.resize(3);
+            settings_timer_seconds_str_ = filtered;
+        };
+        auto timer_input = Input(&settings_timer_seconds_str_, "secs", inp_opt);
+
         ButtonOption btn_opt;
         btn_opt.transform = [](const EntryState& s) {
             auto e = text(s.label) | flex;
@@ -558,14 +647,23 @@ struct Controller::Impl {
         };
         auto back_button = Button("Back", [this] { active_index = previous_tab; }, btn_opt);
 
-        auto checkboxes = Container::Vertical({ undo_checkbox, timer_checkbox });
+        auto checkboxes = Container::Vertical({ undo_checkbox, timer_checkbox, timer_input });
         auto container  = Container::Vertical({ checkboxes, back_button });
 
-        return Renderer(container, [checkboxes, back_button] {
+        return Renderer(container, [this, undo_checkbox, timer_checkbox, timer_input, back_button] {
+            auto timer_row = hbox({
+                text("  Duration: "),
+                timer_input->Render() | size(WIDTH, EQUAL, 6),
+                text(" seconds")
+            });
+            if (!settings_timer_enabled) timer_row = timer_row | dim;
+
             return vbox({
                 text("Settings") | hcenter | bold | color(Color::Cyan),
                 separator(),
-                checkboxes->Render(),
+                undo_checkbox->Render(),
+                timer_checkbox->Render(),
+                timer_row,
                 separator(),
                 back_button->Render()
             }) | border | center;
@@ -592,12 +690,28 @@ struct Controller::Impl {
 
     [[nodiscard]] Element renderGrid() const {
         const auto& board = session.board();
-        const bool is_black_turn = board.getCurrentPlayer() == gomoku::Stone::BLACK;
-        auto status_bar = text(is_black_turn ? "Current player: Black" : "Current player: White") |
-                          bold |
-                          color(is_black_turn ? Color::Red : Color::White) |
-                          hcenter;
 
+        // Top info bar: Mode (left) | Timer status (right)
+        const std::string mode_str = "Mode: " + std::string(active_index == kPveTab ? "PvE" : "PvP");
+        Element timer_status;
+        if (!settings_timer_enabled) {
+            timer_status = text("Timer Off") | dim;
+        } else {
+            const bool urgent = (timer_remaining_ <= 10);
+            timer_status = hbox({
+                text("Time remaining: "),
+                text(std::to_string(timer_remaining_) + "s") | bold |
+                    color(urgent ? Color::Red : Color::Yellow)
+            });
+        }
+        auto info_bar = hbox({ text(" " + mode_str), filler(), timer_status, text(" ") });
+
+        // Current player bar
+        const bool is_black_turn = board.getCurrentPlayer() == gomoku::Stone::BLACK;
+        auto player_bar = text(is_black_turn ? "Current player: Black" : "Current player: White") |
+                          bold | color(is_black_turn ? Color::Red : Color::White) | hcenter;
+
+        // AI status bar
         auto ai_bar = text(session.ai_status_text()) | hcenter;
         if (active_index == kPveTab) {
             ai_bar |= session.ai_used_fallback() ? color(Color::Yellow) : color(Color::Green);
@@ -635,7 +749,8 @@ struct Controller::Impl {
         });
 
         auto board_element = vbox({
-            status_bar,
+            info_bar,
+            player_bar,
             ai_bar,
             separator(),
             vbox(std::move(rows)) | hcenter,
@@ -694,6 +809,13 @@ struct Controller::Impl {
     // Settings state (wired up in Phase C / Phase F)
     bool settings_undo_enabled  = true;
     bool settings_timer_enabled = false;
+
+    // Move timer state
+    std::string         settings_timer_seconds_str_ = "20";
+    int                 timer_remaining_ = 0;
+    int                 consecutive_timeouts_ = 0;
+    std::atomic<bool>   timer_stop_{true};
+    std::thread         timer_thread_;
 
     // Save/Leave submenu state
     bool show_save_menu_     = false;

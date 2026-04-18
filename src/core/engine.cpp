@@ -67,6 +67,12 @@ namespace gomoku {
         return true;
     }
 
+    bool Board::skipTurn() {
+        if (status_ != GameStatus::PLAYING) return false;
+        current_player_ = (current_player_ == Stone::BLACK) ? Stone::WHITE : Stone::BLACK;
+        return true;
+    }
+
     Stone Board::getStone(const int x, const int y) const {
         if (x < 0 || x >= size_ || y < 0 || y >= size_)
             return Stone::EMPTY;
