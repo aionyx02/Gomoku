@@ -9,6 +9,7 @@
 #include "ftxui/dom/elements.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <filesystem>
@@ -16,8 +17,8 @@
 #include <memory>
 #include <optional>
 #include <string>
-
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -31,10 +32,11 @@ constexpr int kPvpTab = 1;
 constexpr int kPveTab = 2;
 constexpr int kResultTab = 3;
 constexpr int kSettingsTab = 4;
-constexpr int kLoadTab = 5;
+constexpr int kLoadTab       = 5;
 constexpr int kRemoteHostTab = 6;
 constexpr int kRemoteJoinTab = 7;
 constexpr int kRemoteWaitTab = 8;
+constexpr int kReplayTab     = 9;
 
 constexpr std::chrono::milliseconds kUiTickInterval{100};
 
@@ -161,6 +163,10 @@ struct Controller::Impl {
         backToMenu();
     }
 
+    ~Impl() {
+        stopReplayAuto();
+    }
+
     void Start() {
         const auto container = Container::Tab({
             renderFrontPage(),
@@ -171,7 +177,8 @@ struct Controller::Impl {
             renderLoadGamePage(),
             renderRemoteHostPage(),
             renderRemoteJoinPage(),
-            renderRemoteWaitPage()
+            renderRemoteWaitPage(),
+            renderReplayPage()
         }, &active_index);
 
         const auto root = CatchEvent(container, [this](const Event& event) {
@@ -406,6 +413,149 @@ struct Controller::Impl {
         }
 
         return changed;
+    }
+
+    void stopReplayAuto() {
+        replay_auto_ = false;
+        replay_auto_stop_.store(true);
+        if (replay_auto_thread_.joinable()) {
+            replay_auto_thread_.join();
+        }
+    }
+
+    void startReplayAuto() {
+        stopReplayAuto();
+        replay_auto_ = true;
+        replay_auto_stop_.store(false);
+        replay_auto_thread_ = std::thread([this] {
+            while (!replay_auto_stop_.load()) {
+                for (int i = 0; i < 10 && !replay_auto_stop_.load(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+                if (!replay_auto_stop_.load()) {
+                    screen_state->screen.PostEvent(Event::Special("replay_tick"));
+                }
+            }
+        });
+    }
+
+    void enterReplay() {
+        stopReplayAuto();
+        replay_history_ = session.move_history();
+        replay_step_    = static_cast<int>(replay_history_.size());
+        active_index    = kReplayTab;
+    }
+
+    [[nodiscard]] Element renderReplayGrid() const {
+        const int board_size = session.board().getSize();
+        const int max_step   = static_cast<int>(replay_history_.size());
+
+        std::unordered_map<int, int> pos_to_step;
+        pos_to_step.reserve(replay_step_);
+        for (int i = 0; i < replay_step_; ++i) {
+            const auto [x, y] = replay_history_[i];
+            pos_to_step[y * board_size + x] = i + 1;
+        }
+
+        auto status_bar = text("Replay  Step " + std::to_string(replay_step_) +
+                               " / " + std::to_string(max_step))
+                          | hcenter | bold | color(Color::Cyan);
+
+        Elements rows;
+        for (int y = 0; y < board_size; ++y) {
+            Elements columns;
+            for (int x = 0; x < board_size; ++x) {
+                const auto it = pos_to_step.find(y * board_size + x);
+                Element cell;
+                if (it != pos_to_step.end()) {
+                    const int  step     = it->second;
+                    const bool is_black = (step % 2 == 1);
+                    const auto s        = std::to_string(step);
+                    std::string padded;
+                    if (s.size() == 1)      padded = "  " + s + "  ";
+                    else if (s.size() == 2) padded = " "  + s + "  ";
+                    else                    padded = s    + "  ";
+                    cell = text(padded)
+                           | color(is_black ? Color::Red : Color::White)
+                           | bold;
+                } else {
+                    cell = text("  +  ")
+                           | color(Color::GrayDark);
+                }
+                columns.push_back(std::move(cell));
+            }
+            rows.push_back(hbox(std::move(columns)));
+        }
+
+        auto bottom_bar = hbox({
+            text(" [R Rewind] ") | bold,
+            filler(),
+            text(" [<- Prev] ") | (replay_step_ > 0 ? bold : dim),
+            filler(),
+            replay_auto_
+                ? (text(" [Space Stop] ") | color(Color::Green) | bold)
+                : (text(" [Space Play] ") | bold),
+            filler(),
+            text(" [Next ->] ") | (replay_step_ < max_step ? bold : dim),
+            filler(),
+            text(" [Esc Back] ") | bold,
+        });
+
+        return vbox({
+            status_bar,
+            separator(),
+            vbox(std::move(rows)) | hcenter,
+            separator(),
+            bottom_bar
+        }) | border | center;
+    }
+
+    Component renderReplayPage() {
+        auto component = std::make_shared<InteractiveBoard>();
+        component->render_logic = [this] { return renderReplayGrid(); };
+        component->event_logic  = [this](const Event& event) {
+            const int max_step = static_cast<int>(replay_history_.size());
+
+            if (event == Event::Special("replay_tick")) {
+                if (replay_auto_ && replay_step_ < max_step) {
+                    ++replay_step_;
+                    if (replay_step_ == max_step) {
+                        stopReplayAuto();
+                    }
+                }
+                return true;
+            }
+            if (event == Event::Escape) {
+                stopReplayAuto();
+                active_index = kResultTab;
+                return true;
+            }
+            if (event == Event::ArrowLeft) {
+                if (replay_step_ > 0) --replay_step_;
+                return true;
+            }
+            if (event == Event::ArrowRight) {
+                if (replay_step_ < max_step) ++replay_step_;
+                return true;
+            }
+            if (event == Event::Character('r') || event == Event::Character('R')) {
+                replay_step_ = 0;
+                stopReplayAuto();
+                startReplayAuto();
+                return true;
+            }
+            if (event == Event::Character(' ')) {
+                if (replay_auto_) {
+                    stopReplayAuto();
+                } else {
+                    startReplayAuto();
+                }
+                return true;
+            }
+            return false;
+        };
+
+        return component;
     }
 
     void refreshSavesList() {
@@ -843,8 +993,9 @@ struct Controller::Impl {
             }
             startGame(session.mode());
         });
+        auto replay_button = Button("View Replay", [this] { enterReplay(); });
 
-        auto container = Container::Vertical({back_button, play_again_button});
+        auto container = Container::Vertical({back_button, play_again_button, replay_button});
 
         return Renderer(container, [container, this] {
             Elements content = {
@@ -1100,6 +1251,12 @@ struct Controller::Impl {
     bool load_directory_error_ = false;
     std::string remote_host_input_ = "127.0.0.1";
     std::string remote_port_input_ = "7777";
+
+    std::vector<std::pair<int,int>> replay_history_;
+    int                replay_step_ = 0;
+    bool               replay_auto_ = false;
+    std::atomic<bool>  replay_auto_stop_{true};
+    std::thread        replay_auto_thread_;
 };
 
 Controller::Controller(gomoku::GameSession& session)
