@@ -295,6 +295,7 @@ const std::string& GameSession::last_persistence_error() const {
     return last_persistence_error_;
 }
 
+
 bool GameSession::skipTurn() {
     return board_.skipTurn();
 }
