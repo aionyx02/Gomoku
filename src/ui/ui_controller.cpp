@@ -107,7 +107,7 @@ Element stoneCellElement(const gomoku::Stone stone) {
 
 std::string trimCopy(std::string value) {
     const auto is_space = [](const unsigned char ch) { return std::isspace(ch) != 0; };
-    value.erase(value.begin(), std::ranges::find_if(value, [&](const unsigned char ch) {
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](const unsigned char ch) {
         return !is_space(ch);
     }));
     value.erase(std::find_if(value.rbegin(), value.rend(), [&](const unsigned char ch) {
@@ -153,8 +153,9 @@ struct Controller::Impl {
         : session(game_session),
           network(game_session),
           screen_state(std::make_unique<ScreenState>()) {
-        ui_tick_ = std::jthread([this](const std::stop_token& stop_token) {
-            while (!stop_token.stop_requested()) {
+        ui_tick_stop_.store(false);
+        ui_tick_ = std::thread([this] {
+            while (!ui_tick_stop_.load()) {
                 std::this_thread::sleep_for(kUiTickInterval);
                 if (screen_state) {
                     screen_state->screen.PostEvent(Event::Custom);
@@ -165,6 +166,10 @@ struct Controller::Impl {
     }
 
     ~Impl() {
+        ui_tick_stop_.store(true);
+        if (ui_tick_.joinable()) {
+            ui_tick_.join();
+        }
         stopReplayAuto();
         stopTimer();
     }
@@ -659,7 +664,7 @@ struct Controller::Impl {
             return;
         }
 
-        std::ranges::sort(save_files_, std::greater<>());
+        std::sort(save_files_.begin(), save_files_.end(), std::greater<>());
     }
 
     Component renderLoadGamePage() {
@@ -754,8 +759,23 @@ struct Controller::Impl {
             save_menu_selected_ = (save_menu_selected_ + 1) % kSaveMenuItems;
             return true;
         }
-        if (event == Event::Escape) {
+        if (event == Event::Escape || event == Event::Character('e') || event == Event::Character('E')) {
             show_save_menu_ = false;
+            return true;
+        }
+        // Hotkey shortcuts: S for Save (only), L for Leave
+        if (event == Event::Character('s') || event == Event::Character('S')) {
+            // S key directly executes Save
+            if (!session.serialize().empty()) {
+                setStatusMsg("Game saved!", 1500);
+            }
+            show_save_menu_ = false;
+            return true;
+        }
+        if (event == Event::Character('l') || event == Event::Character('L')) {
+            // Leave
+            show_save_menu_ = false;
+            backToMenu();
             return true;
         }
         if (event == Event::Return) {
@@ -843,11 +863,19 @@ struct Controller::Impl {
                 separator(),
                 menu->Render() | hcenter,
                 separator(),
-                text("Use arrow keys to move, Enter/Space to place") | dim | hcenter
+                text(" use arrow keys to move, ENTER to select ") | dim | hcenter
             }) | border | center;
         });
 
-        component |= CatchEvent([this](const Event& event) {
+        component |= CatchEvent([this, menu](const Event& event) {
+            const int menu_count = static_cast<int>(menu_entries.size());
+            if (menu_count > 0 && event == Event::ArrowUp && menu_selected == 0) {
+                return menu->OnEvent(Event::End);
+            }
+            if (menu_count > 0 && event == Event::ArrowDown && menu_selected == menu_count - 1) {
+                return menu->OnEvent(Event::Home);
+            }
+
             if (event != Event::Return) {
                 return false;
             }
@@ -915,7 +943,7 @@ struct Controller::Impl {
             }
 
             if (show_save_menu_) {
-                return true;
+                return handleSaveMenuEventWrapper(event);
             }
 
             if (handleCursorMove(event)) {
@@ -929,7 +957,7 @@ struct Controller::Impl {
 
             if (event == Event::Character('l') || event == Event::Character('L')) {
                 if (remote_mode_) {
-                    updateRemoteStatus("Save/leave is disabled during remote games. Press Q to disconnect.");
+                    updateRemoteStatus("Save/Leave is disabled during remote games. Press Q to disconnect.");
                     return true;
                 }
                 show_save_menu_ = true;
@@ -1022,6 +1050,13 @@ struct Controller::Impl {
         return component;
     }
 
+    bool handleSaveMenuEventWrapper(const Event& event) {
+        if (show_save_menu_) {
+            return handleSaveMenuEvent(event);
+        }
+        return false;
+    }
+
     Component renderSetupPage() {
         CheckboxOption cb_opt;
         cb_opt.transform = [](const EntryState& state) {
@@ -1084,7 +1119,7 @@ struct Controller::Impl {
                 text("\u00b7 Black \u25cb goes first, alternate") | dim,
                 text(""),
                 text("\u2191\u2193\u2190\u2192 Move   Enter/Space Place") | dim,
-                text("U Undo   S Setup   L Save/Leave") | dim,
+                text("U Undo   S Setup   L Leave/Save") | dim,
             });
 
             auto setup_box = vbox({
@@ -1124,7 +1159,7 @@ struct Controller::Impl {
             Elements box_content = {
                 text("Game Over") | hcenter | bold | color(Color::Red),
                 separator(),
-                text("Result: " + gameResultText(session.status())) | hcenter | color(Color::Yellow),
+                text("Result: " + gameResultText(session.status())) | hcenter | color(Color::Blue),
                 separator()
             };
             if (remote_mode_) {
@@ -1134,7 +1169,7 @@ struct Controller::Impl {
             }
             box_content.push_back(vbox(std::move(items)));
             box_content.push_back(separator());
-            box_content.push_back(text("\u2191\u2193 Move  Enter Confirm") | dim | hcenter);
+            box_content.push_back(text(" \u2191\u2193 Move  Enter Confirm ") | dim | hcenter);
 
             auto result_box = vbox(std::move(box_content)) | border | center;
             return dbox({ renderGrid(), result_box | clear_under | center });
@@ -1291,7 +1326,7 @@ struct Controller::Impl {
             if (!settings_timer_enabled) {
                 timer_status = text("Timer Off") | dim;
             } else {
-                const bool urgent = (timer_remaining_ <= 10);
+                const bool urgent = (timer_remaining_ <= 5);
                 timer_status = hbox({
                     text("Time remaining: "),
                     text(std::to_string(timer_remaining_) + "s") | bold |
@@ -1342,32 +1377,55 @@ struct Controller::Impl {
         }
 
         // Hint line: urgent timer > timed status message > default controls
+        // Use fixed width to prevent layout shift when content changes
         Element hint_line;
+        std::string hint_text;
+        bool hint_is_status = false;
+        
         if (settings_timer_enabled && timer_remaining_ > 0 && timer_remaining_ <= 3) {
-            hint_line = text("  Hurry up!  ") | bold | color(Color::Red) | hcenter;
+            hint_text = "  Hurry up! You'll get skipped!  ";
+            hint_is_status = true;
         } else {
             const auto msg = activeStatusMsg();
             if (!msg.empty()) {
-                hint_line = text("  " + msg + "  ") | color(Color::Yellow) | hcenter;
+                hint_text = "  " + msg + "  ";
+                hint_is_status = true;
             } else {
-                hint_line = text("↑↓←→ Move  Enter/Space Place  |  S Setup  U Undo  L Save") | dim | hcenter;
+                hint_text = "↑↓←→ Move  |  [Enter]/[Space] Place   ";
             }
         }
+        
+        // Pad or truncate to fixed width to prevent layout shift
+        const int kHintLineWidth = 45;
+        if (static_cast<int>(hint_text.length()) < kHintLineWidth) {
+            const int padding = kHintLineWidth - hint_text.length();
+            const int left_pad = padding / 2;
+            const int right_pad = padding - left_pad;
+            hint_text = std::string(left_pad, ' ') + hint_text + std::string(right_pad, ' ');
+        }
+        
+        hint_line = text(hint_text);
+        if (hint_is_status) {
+            hint_line |= color(Color::Yellow);
+        } else {
+            hint_line |= dim;
+        }
+        hint_line |= hcenter;
 
         auto bottom_bar = remote_mode_
             ? hbox({
-                text(" [Setup(S)] ") | bold,
+                text(" [S]Setup ") | bold,
                 filler(),
-                text(" [Undo(U)] ") | (settings_undo_enabled ? bold : dim),
+                text(" [U]Undo ") | (settings_undo_enabled ? bold : dim),
                 filler(),
-                text(" [Disconnect(Q)] ") | bold
+                text(" [Q]Disconnect ") | bold
             })
             : hbox({
-                text(" [Setup(S)] ") | bold,
+                text(" [S]Setup ") | bold,
                 filler(),
-                text(" [Undo(U)] ") | (settings_undo_enabled ? bold : dim),
+                text(" [U]Undo ") | (settings_undo_enabled ? bold : dim),
                 filler(),
-                text(" [Save/Leave(L)] ") | bold
+                text(" [L]Leave/Save ") | bold
             });
 
         auto board_element = vbox({
@@ -1387,9 +1445,9 @@ struct Controller::Impl {
 
         const std::vector<std::string> save_menu_labels = {
             "Save & Leave",
-            "Save",
-            "Leave",
-            "Cancel"
+            "[S] Save",
+            "[L] Leave",
+            "[ESC] Back"
         };
 
         Elements menu_items;
@@ -1402,11 +1460,11 @@ struct Controller::Impl {
         }
 
         const auto overlay = vbox({
-            text("Save / Leave") | hcenter | bold | color(Color::Cyan),
+            text("Leave Game?") | hcenter | bold | color(Color::Cyan),
             separator(),
             vbox(std::move(menu_items)),
             separator(),
-            text("Arrow keys Move  Enter Confirm  Esc Cancel") | dim | hcenter
+            text(" ↑↓ Move  Enter Confirm ") | dim | hcenter
         }) | border | bgcolor(Color::Black) | center;
 
         return dbox({ board_element, overlay | clear_under | center });
@@ -1415,7 +1473,8 @@ struct Controller::Impl {
     gomoku::GameSession& session;
     gomoku::webConnect network;
     std::unique_ptr<ScreenState> screen_state;
-    std::jthread ui_tick_;
+    std::thread ui_tick_;
+    std::atomic<bool> ui_tick_stop_{false};
 
     std::vector<std::string> menu_entries = {
         "Start Game (PvP)",
