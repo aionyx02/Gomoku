@@ -133,3 +133,7 @@ target_link_libraries(Gomoku_Project PRIVATE
         pybind11::module
         gomoku_core
 )
+
+if(WIN32)
+    target_link_libraries(Gomoku_Project PRIVATE ws2_32)
+endif()
