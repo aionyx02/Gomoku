@@ -84,21 +84,21 @@ std::string stoneText(const gomoku::Stone stone) {
 
 Element framedStoneCell(const std::string& symbol, const Color symbol_color) {
     return hbox({
-        text("  "),
+        text(" "),
         text(symbol) | color(symbol_color) | bold,
         text(" ")
-    }) | size(WIDTH, EQUAL, 5) | hcenter;
+    }) | size(WIDTH, EQUAL, 3) | hcenter;
 }
 
 Element stoneCellElement(const gomoku::Stone stone) {
     switch (stone) {
         case gomoku::Stone::WHITE:
-            return framedStoneCell("O", Color::White);
+            return framedStoneCell("●", Color::White);
         case gomoku::Stone::BLACK:
-            return framedStoneCell("X", Color::Red);
+            return framedStoneCell("○", Color::Red);
         case gomoku::Stone::EMPTY:
         default:
-            return text("  +  ") | color(Color::GrayDark) | size(WIDTH, EQUAL, 5) | hcenter;
+            return text(" + ") | color(Color::GrayDark) | size(WIDTH, EQUAL, 3) | hcenter;
     }
 }
 
@@ -247,8 +247,19 @@ struct Controller::Impl {
         show_save_menu_ = false;
     }
 
+    void clearLocalStatus() {
+        local_status_text_.clear();
+        local_status_color_ = Color::GrayDark;
+    }
+
+    void setLocalStatus(std::string message, const Color color = Color::Red) {
+        local_status_text_ = std::move(message);
+        local_status_color_ = color;
+    }
+
     void startGame(const gomoku::SessionMode next_mode) {
         shutdownRemoteSession();
+        clearLocalStatus();
         session.start(next_mode);
         centerCursor();
 
@@ -261,6 +272,7 @@ struct Controller::Impl {
 
     void backToMenu() {
         shutdownRemoteSession();
+        clearLocalStatus();
         session.reset();
         active_index = kMenuTab;
         current_x = 0;
@@ -269,6 +281,7 @@ struct Controller::Impl {
 
     void openRemoteHostPage() {
         shutdownRemoteSession();
+        clearLocalStatus();
         session.start(gomoku::SessionMode::PVP);
         centerCursor();
         remote_status_text_ = "Choose a port and start hosting.";
@@ -277,6 +290,7 @@ struct Controller::Impl {
 
     void openRemoteJoinPage() {
         shutdownRemoteSession();
+        clearLocalStatus();
         session.start(gomoku::SessionMode::PVP);
         centerCursor();
         remote_status_text_ = "Enter the host IP and port.";
@@ -284,6 +298,7 @@ struct Controller::Impl {
     }
 
     bool beginHosting() {
+        clearLocalStatus();
         const auto port = parsePortValue(remote_port_input_);
         if (!port) {
             updateRemoteStatus("Port must be between 1 and 65535.");
@@ -309,6 +324,7 @@ struct Controller::Impl {
     }
 
     bool beginJoin() {
+        clearLocalStatus();
         const std::string host = trimCopy(remote_host_input_);
         if (host.empty()) {
             updateRemoteStatus("Host IP or hostname cannot be empty.");
@@ -411,14 +427,20 @@ struct Controller::Impl {
         auto component = std::make_shared<InteractiveBoard>();
 
         component->render_logic = [this] {
+            Elements content = {
+                text("Load Game") | hcenter | bold | color(Color::Cyan),
+                separator()
+            };
+
             if (save_files_.empty()) {
-                return vbox({
-                    text("Load Game") | hcenter | bold | color(Color::Cyan),
-                    separator(),
-                    text("No saves found in: " + session.saves_dir()) | dim | hcenter,
-                    separator(),
-                    text("Esc Back to menu") | dim | hcenter
-                }) | border | center;
+                content.push_back(text("No saves found in: " + session.saves_dir()) | dim | hcenter);
+                if (!local_status_text_.empty()) {
+                    content.push_back(separator());
+                    content.push_back(text(local_status_text_) | color(local_status_color_) | hcenter);
+                }
+                content.push_back(separator());
+                content.push_back(text("Esc Back to menu") | dim | hcenter);
+                return vbox(std::move(content)) | border | center;
             }
 
             Elements items;
@@ -432,13 +454,14 @@ struct Controller::Impl {
                 items.push_back(item);
             }
 
-            return vbox({
-                text("Load Game") | hcenter | bold | color(Color::Cyan),
-                separator(),
-                vbox(std::move(items)),
-                separator(),
-                text("Arrow keys Select  Enter Load  Esc Back") | dim | hcenter
-            }) | border | center;
+            content.push_back(vbox(std::move(items)));
+            if (!local_status_text_.empty()) {
+                content.push_back(separator());
+                content.push_back(text(local_status_text_) | color(local_status_color_) | hcenter);
+            }
+            content.push_back(separator());
+            content.push_back(text("Arrow keys Select  Enter Load  Esc Back") | dim | hcenter);
+            return vbox(std::move(content)) | border | center;
         };
 
         component->event_logic = [this](const Event& event) {
@@ -459,13 +482,16 @@ struct Controller::Impl {
                 return true;
             }
             if (event == Event::Return && !save_files_.empty()) {
-                shutdownRemoteSession();
                 if (session.deserialize(save_files_[load_selected_])) {
+                    shutdownRemoteSession();
+                    clearLocalStatus();
                     syncCursorToSession();
                     active_index = (session.mode() == gomoku::SessionMode::PVE) ? kPveTab : kPvpTab;
                     if (session.status() != gomoku::GameStatus::PLAYING) {
                         active_index = kResultTab;
                     }
+                } else {
+                    setLocalStatus("Load failed: " + session.last_persistence_error());
                 }
                 return true;
             }
@@ -492,17 +518,31 @@ struct Controller::Impl {
         }
         if (event == Event::Return) {
             switch (save_menu_selected_) {
-                case 0:
-                    session.serialize();
+                case 0: {
+                    const std::string path = session.serialize();
+                    if (path.empty()) {
+                        setLocalStatus("Save failed: " + session.last_persistence_error());
+                        break;
+                    }
                     show_save_menu_ = false;
+                    clearLocalStatus();
                     backToMenu();
                     break;
-                case 1:
-                    session.serialize();
+                }
+                case 1: {
+                    const std::string path = session.serialize();
+                    if (path.empty()) {
+                        setLocalStatus("Save failed: " + session.last_persistence_error());
+                        break;
+                    }
                     show_save_menu_ = false;
+                    namespace fs = std::filesystem;
+                    setLocalStatus("Saved to " + fs::path(path).filename().string(), Color::Green);
                     break;
+                }
                 case 2:
                     show_save_menu_ = false;
+                    clearLocalStatus();
                     backToMenu();
                     break;
                 case 3:
@@ -681,6 +721,7 @@ struct Controller::Impl {
                     updateRemoteStatus("Move failed: " + network.lastError());
                     return true;
                 }
+                clearLocalStatus();
                 syncCursorToSession();
                 updateRemoteStatus();
                 tryMoveToResult();
@@ -691,6 +732,7 @@ struct Controller::Impl {
                 return false;
             }
 
+            clearLocalStatus();
             tryMoveToResult();
             if (has_ai && session.status() == gomoku::GameStatus::PLAYING) {
                 runAiTurn();
@@ -902,12 +944,14 @@ struct Controller::Impl {
                           hcenter;
 
         Element info_bar = text("Local PvP") | dim | hcenter;
-        if (active_index == kPveTab) {
-            info_bar = text(session.ai_status_text()) | hcenter;
-            info_bar |= session.ai_used_fallback() ? color(Color::Yellow) : color(Color::Green);
-        } else if (remote_mode_) {
+        if (remote_mode_) {
             info_bar = text(remote_status_text_) | hcenter;
             info_bar |= color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_));
+        } else if (!local_status_text_.empty()) {
+            info_bar = text(local_status_text_) | hcenter | color(local_status_color_);
+        } else if (active_index == kPveTab) {
+            info_bar = text(session.ai_status_text()) | hcenter;
+            info_bar |= session.ai_used_fallback() ? color(Color::Yellow) : color(Color::Green);
         }
 
         Elements rows;
@@ -1020,6 +1064,8 @@ struct Controller::Impl {
     bool remote_mode_ = false;
     bool remote_waiting_for_peer_ = false;
     std::string remote_status_text_;
+    std::string local_status_text_;
+    Color local_status_color_ = Color::GrayDark;
     std::string remote_host_input_ = "127.0.0.1";
     std::string remote_port_input_ = "7777";
 };

@@ -5,6 +5,7 @@
  * @brief Remote PvP socket transport implementation.
  */
 #include "../../include/gomoku/net/webConnect.h"
+#include "../../include/gomoku/net/webconnect_protocol.h"
 
 #include <algorithm>
 #include <array>
@@ -182,7 +183,7 @@ WaitResult waitForReadable(const SocketHandle socket,
     timeval tv{};
     timeval* tv_ptr = nullptr;
     if (timeout.has_value()) {
-        const auto safe_timeout = std::max(timeout->count(), 0LL);
+        const auto safe_timeout = std::max(timeout->count(), std::chrono::milliseconds::rep{0});
         tv.tv_sec = static_cast<long>(safe_timeout / 1000);
         tv.tv_usec = static_cast<long>((safe_timeout % 1000) * 1000);
         tv_ptr = &tv;
@@ -318,7 +319,7 @@ bool applySnapshot(GameSession& session, const std::string& encoded_moves, std::
             error = "Invalid snapshot coordinates: " + std::string(move);
             return false;
         }
-        if (!session.human_move(x, y)) {
+        if (!session.human_move(x, y, false)) {
             error = "Snapshot replay rejected move (" + std::to_string(x) + "," + std::to_string(y) + ")";
             return false;
         }
@@ -333,6 +334,27 @@ bool applySnapshot(GameSession& session, const std::string& encoded_moves, std::
 }
 
 } // namespace
+
+namespace net {
+
+bool applyRemoteMove(GameSession& session,
+                     const Stone remote_stone,
+                     const int x,
+                     const int y,
+                     std::string& error) {
+    if (session.board().getCurrentPlayer() != remote_stone) {
+        error = "Rejected remote MOVE at (" + std::to_string(x) + "," + std::to_string(y) +
+                "): it is not the remote player's turn.";
+        return false;
+    }
+    if (!session.human_move(x, y)) {
+        error = "Remote move rejected at (" + std::to_string(x) + "," + std::to_string(y) + ")";
+        return false;
+    }
+    return true;
+}
+
+} // namespace net
 
 struct webConnect::Impl {
     SocketOwner listener;
@@ -403,14 +425,17 @@ struct webConnect::Impl {
         }
 
         if (command == "MOVE") {
+            if (!handshake_complete) {
+                last_error = "Received MOVE before the handshake completed.";
+                return false;
+            }
             int x = 0;
             int y = 0;
             if (!(stream >> x >> y)) {
                 last_error = "Malformed MOVE packet: " + raw_line;
                 return false;
             }
-            if (!session.human_move(x, y)) {
-                last_error = "Remote move rejected at (" + std::to_string(x) + "," + std::to_string(y) + ")";
+            if (!net::applyRemoteMove(session, remote_stone, x, y, last_error)) {
                 return false;
             }
             last_error.clear();

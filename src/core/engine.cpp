@@ -12,7 +12,6 @@
  *   is an O(N) memory block copy (where N = 225), highly optimized for tree search.
  */
 #include "../../include/gomoku/core/engine.h"
-#include "../../include/gomoku/audio/voice.h"
 
 namespace gomoku {
 
@@ -50,8 +49,6 @@ namespace gomoku {
                 current_player_ = (current_player_ == Stone::BLACK) ? Stone::WHITE : Stone::BLACK;
             }
         }
-
-        gameVoice.placeStoneSound();
         return true;
     }
 

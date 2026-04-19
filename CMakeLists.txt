@@ -42,3 +42,24 @@ target_link_libraries(Gomoku_Project PRIVATE
 if(WIN32)
     target_link_libraries(Gomoku_Project PRIVATE ws2_32)
 endif()
+
+enable_testing()
+
+add_executable(gomoku_regression_tests
+        tests/regression_tests.cpp
+        src/ai/ai_player.cpp
+        src/core/game_session.cpp
+        src/net/webConnect.cpp
+)
+
+target_include_directories(gomoku_regression_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(gomoku_regression_tests PRIVATE
+        GOMOKU_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+target_link_libraries(gomoku_regression_tests PRIVATE gomoku_core)
+
+if(WIN32)
+    target_link_libraries(gomoku_regression_tests PRIVATE ws2_32)
+endif()
+
+add_test(NAME gomoku_regression_tests COMMAND gomoku_regression_tests)

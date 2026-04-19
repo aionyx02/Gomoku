@@ -1,4 +1,5 @@
 #include "../../include/gomoku/core/game_session.h"
+#include "../../include/gomoku/audio/voice.h"
 
 #include <algorithm>
 #include <chrono>
@@ -11,6 +12,37 @@
 #include <utility>
 
 namespace gomoku {
+
+namespace {
+
+constexpr int kMinSerializedBoardSize = 1;
+constexpr int kMaxSerializedBoardSize = 255;
+
+void playStoneAudioIfEnabled(const bool play_audio) {
+    if (play_audio) {
+        gameVoice.placeStoneSound();
+    }
+}
+
+[[nodiscard]] bool parseModeToken(const std::string& token, SessionMode& mode) {
+    if (token == "PVE") {
+        mode = SessionMode::PVE;
+        return true;
+    }
+    if (token == "PVP") {
+        mode = SessionMode::PVP;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] std::string makeAiStatusText(const SessionMode mode) {
+    return mode == SessionMode::PVE
+        ? "AI: ready (C++ reward engine)"
+        : "AI: disabled in PvP";
+}
+
+} // namespace
 
 GameSession::GameSession(const int board_size,
                          std::string saves_dir)
@@ -31,14 +63,10 @@ void GameSession::reset() {
     move_history_.clear();
     ai_used_fallback_ = false;
 
-    if (mode_ == SessionMode::PVE) {
-        ai_status_text_ = "AI: ready (C++ reward engine)";
-    } else {
-        ai_status_text_ = "AI: disabled in PvP";
-    }
+    ai_status_text_ = makeAiStatusText(mode_);
 }
 
-bool GameSession::human_move(const int x, const int y) {
+bool GameSession::human_move(const int x, const int y, const bool play_audio) {
     if (board_.getStatus() != GameStatus::PLAYING) {
         return false;
     }
@@ -51,6 +79,7 @@ bool GameSession::human_move(const int x, const int y) {
         return false;
     }
 
+    playStoneAudioIfEnabled(play_audio);
     last_move_ = std::pair{x, y};
     move_history_.emplace_back(x, y);
     return true;
@@ -81,6 +110,7 @@ bool GameSession::ai_move() {
         return false;
     }
 
+    playStoneAudioIfEnabled(true);
     last_move_ = std::pair{x, y};
     move_history_.emplace_back(x, y);
     ai_status_text_ = "AI(reward): move (" + std::to_string(x) + "," + std::to_string(y) + ")";
@@ -126,9 +156,14 @@ const std::string& GameSession::saves_dir() const {
 
 std::string GameSession::serialize() const {
     namespace fs = std::filesystem;
+    last_persistence_error_.clear();
+
     std::error_code ec;
     fs::create_directories(saves_dir_, ec);
-    if (ec) return {};
+    if (ec) {
+        last_persistence_error_ = "Failed to create save directory: " + saves_dir_ + " (" + ec.message() + ")";
+        return {};
+    }
 
     auto now = std::chrono::system_clock::now();
     auto t   = std::chrono::system_clock::to_time_t(now);
@@ -143,47 +178,124 @@ std::string GameSession::serialize() const {
     const std::string filepath = (fs::path(saves_dir_) / name.str()).string();
 
     std::ofstream f(filepath);
-    if (!f) return {};
+    if (!f) {
+        last_persistence_error_ = "Failed to open save file: " + filepath;
+        return {};
+    }
 
     f << "mode " << (mode_ == SessionMode::PVE ? "PVE" : "PVP") << "\n";
     f << "size " << board_size_ << "\n";
     for (const auto& [x, y] : move_history_) {
         f << x << " " << y << "\n";
     }
+
+    f.flush();
+    if (!f) {
+        last_persistence_error_ = "Failed to write save file: " + filepath;
+        return {};
+    }
+
     return filepath;
 }
 
 bool GameSession::deserialize(const std::string& filepath) {
+    last_persistence_error_.clear();
+
     std::ifstream f(filepath);
-    if (!f) return false;
-
-    std::string key, val;
-    if (!(f >> key >> val) || key != "mode") return false;
-    const SessionMode file_mode = (val == "PVE") ? SessionMode::PVE : SessionMode::PVP;
-
-    int file_size{};
-    if (!(f >> key >> file_size) || key != "size") return false;
-
-    board_size_ = file_size;
-    mode_       = file_mode;
-    board_      = Board(board_size_);
-    move_history_.clear();
-    last_move_.reset();
-    ai_used_fallback_ = false;
-
-    int x{}, y{};
-    while (f >> x >> y) {
-        if (!board_.placeStone(x, y)) break;
-        move_history_.emplace_back(x, y);
+    if (!f) {
+        last_persistence_error_ = "Failed to open save file: " + filepath;
+        return false;
     }
+
+    std::string line;
+    if (!std::getline(f, line)) {
+        last_persistence_error_ = "Save file is missing the mode header.";
+        return false;
+    }
+
+    std::istringstream mode_line(line);
+    std::string mode_key;
+    std::string mode_value;
+    if (!(mode_line >> mode_key >> mode_value) || mode_key != "mode") {
+        last_persistence_error_ = "Invalid mode header in save file.";
+        return false;
+    }
+    SessionMode parsed_mode = SessionMode::PVP;
+    if (!parseModeToken(mode_value, parsed_mode)) {
+        last_persistence_error_ = "Unsupported mode token in save file: " + mode_value;
+        return false;
+    }
+    std::string extra_token;
+    if (mode_line >> extra_token) {
+        last_persistence_error_ = "Mode header contains unexpected trailing data.";
+        return false;
+    }
+
+    if (!std::getline(f, line)) {
+        last_persistence_error_ = "Save file is missing the board size header.";
+        return false;
+    }
+
+    std::istringstream size_line(line);
+    std::string size_key;
+    int parsed_size = 0;
+    if (!(size_line >> size_key >> parsed_size) || size_key != "size") {
+        last_persistence_error_ = "Invalid size header in save file.";
+        return false;
+    }
+    if (size_line >> extra_token) {
+        last_persistence_error_ = "Size header contains unexpected trailing data.";
+        return false;
+    }
+    if (parsed_size < kMinSerializedBoardSize || parsed_size > kMaxSerializedBoardSize) {
+        last_persistence_error_ = "Board size out of supported range: " + std::to_string(parsed_size);
+        return false;
+    }
+
+    Board parsed_board(parsed_size);
+    std::vector<std::pair<int, int>> parsed_history;
+
+    int line_number = 2;
+    while (std::getline(f, line)) {
+        ++line_number;
+
+        std::istringstream move_line(line);
+        int x = 0;
+        int y = 0;
+        if (!(move_line >> x >> y)) {
+            last_persistence_error_ = "Invalid move entry at line " + std::to_string(line_number) + ".";
+            return false;
+        }
+        if (move_line >> extra_token) {
+            last_persistence_error_ = "Move entry has unexpected trailing data at line " + std::to_string(line_number) + ".";
+            return false;
+        }
+        if (!parsed_board.placeStone(x, y)) {
+            last_persistence_error_ = "Illegal move in save file at line " + std::to_string(line_number) + ".";
+            return false;
+        }
+        parsed_history.emplace_back(x, y);
+    }
+
+    if (!f.eof()) {
+        last_persistence_error_ = "Failed while reading save file: " + filepath;
+        return false;
+    }
+
+    board_size_ = parsed_size;
+    mode_ = parsed_mode;
+    board_ = std::move(parsed_board);
+    move_history_ = std::move(parsed_history);
     last_move_ = move_history_.empty()
         ? std::nullopt
         : std::optional{move_history_.back()};
-
-    ai_status_text_ = (mode_ == SessionMode::PVE)
-        ? "AI: ready (C++ reward engine)"
-        : "AI: disabled in PvP";
+    ai_used_fallback_ = false;
+    ai_status_text_ = makeAiStatusText(mode_);
     return true;
+}
+
+const std::string& GameSession::last_persistence_error() const {
+    return last_persistence_error_;
 }
 
 bool GameSession::skipTurn() {

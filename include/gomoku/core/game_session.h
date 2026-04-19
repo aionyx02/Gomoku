@@ -30,7 +30,7 @@ public:
     void start(SessionMode next_mode);
     void reset();
 
-    bool human_move(int x, int y);
+    bool human_move(int x, int y, bool play_audio = true);
     bool ai_move();
 
     [[nodiscard]] const Board& board() const;
@@ -49,6 +49,7 @@ public:
     bool deserialize(const std::string& filepath);
 
     [[nodiscard]] const std::string& saves_dir() const;
+    [[nodiscard]] const std::string& last_persistence_error() const;
 
 private:
     int board_size_ = 15;
@@ -60,6 +61,7 @@ private:
     std::optional<std::pair<int, int>> last_move_;
     std::vector<std::pair<int, int>> move_history_;
     std::string saves_dir_;
+    mutable std::string last_persistence_error_;
 };
 
 } // namespace gomoku
