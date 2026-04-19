@@ -1,5 +1,7 @@
 #include "gomoku/ui_controller.h"
 
+#include "gomoku/webConnect.h"
+
 #include "ftxui/component/component.hpp"
 #include "ftxui/component/component_base.hpp"
 #include "ftxui/component/event.hpp"
@@ -7,15 +9,15 @@
 #include "ftxui/dom/elements.hpp"
 
 #include <algorithm>
-#include <atomic>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
-#include <string>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -28,9 +30,13 @@ constexpr int kMenuTab = 0;
 constexpr int kPvpTab = 1;
 constexpr int kPveTab = 2;
 constexpr int kResultTab = 3;
-constexpr int kSetupTab    = 4;
-constexpr int kLoadTab   = 5;
-constexpr int kReplayTab = 6;
+constexpr int kSettingsTab = 4;
+constexpr int kLoadTab = 5;
+constexpr int kRemoteHostTab = 6;
+constexpr int kRemoteJoinTab = 7;
+constexpr int kRemoteWaitTab = 8;
+
+constexpr std::chrono::milliseconds kUiTickInterval{100};
 
 class InteractiveBoard final : public ComponentBase {
 public:
@@ -64,6 +70,18 @@ std::string gameResultText(const gomoku::GameStatus status) {
     }
 }
 
+std::string stoneText(const gomoku::Stone stone) {
+    switch (stone) {
+        case gomoku::Stone::BLACK:
+            return "Black";
+        case gomoku::Stone::WHITE:
+            return "White";
+        case gomoku::Stone::EMPTY:
+        default:
+            return "None";
+    }
+}
+
 Element framedStoneCell(const std::string& symbol, const Color symbol_color) {
     return hbox({
         text("  "),
@@ -75,13 +93,51 @@ Element framedStoneCell(const std::string& symbol, const Color symbol_color) {
 Element stoneCellElement(const gomoku::Stone stone) {
     switch (stone) {
         case gomoku::Stone::WHITE:
-            return framedStoneCell("●", Color::White);
+            return framedStoneCell("O", Color::White);
         case gomoku::Stone::BLACK:
-            return framedStoneCell("○", Color::Red);
+            return framedStoneCell("X", Color::Red);
         case gomoku::Stone::EMPTY:
         default:
             return text("  +  ") | color(Color::GrayDark) | size(WIDTH, EQUAL, 5) | hcenter;
     }
+}
+
+std::string trimCopy(std::string value) {
+    const auto is_space = [](const unsigned char ch) { return std::isspace(ch) != 0; };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](const unsigned char ch) {
+        return !is_space(ch);
+    }));
+    value.erase(std::find_if(value.rbegin(), value.rend(), [&](const unsigned char ch) {
+        return !is_space(ch);
+    }).base(), value.end());
+    return value;
+}
+
+std::optional<std::uint16_t> parsePortValue(const std::string& raw_value) {
+    const std::string value = trimCopy(raw_value);
+    if (value.empty()) {
+        return std::nullopt;
+    }
+
+    int port = 0;
+    const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), port);
+    if (ec != std::errc{} || ptr != value.data() + value.size()) {
+        return std::nullopt;
+    }
+    if (port < 1 || port > 65535) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint16_t>(port);
+}
+
+Color remoteStatusColor(const bool connected, const bool waiting) {
+    if (connected) {
+        return Color::Green;
+    }
+    if (waiting) {
+        return Color::Yellow;
+    }
+    return Color::Orange1;
 }
 
 } // namespace
@@ -93,27 +149,40 @@ struct Controller::Impl {
 
     explicit Impl(gomoku::GameSession& game_session)
         : session(game_session),
+          network(game_session),
           screen_state(std::make_unique<ScreenState>()) {
+        ui_tick_ = std::jthread([this](const std::stop_token stop_token) {
+            while (!stop_token.stop_requested()) {
+                std::this_thread::sleep_for(kUiTickInterval);
+                if (screen_state) {
+                    screen_state->screen.PostEvent(Event::Custom);
+                }
+            }
+        });
         backToMenu();
     }
 
-    ~Impl() {
-        stopReplayAuto();
-        stopTimer();
-    }
-
     void Start() {
-        const auto container = Container::Tab({
+        auto container = Container::Tab({
             renderFrontPage(),
             renderGameBoard(false),
             renderGameBoard(true),
             renderEndPage(),
-            renderSetupPage(),
+            renderSettingsPage(),
             renderLoadGamePage(),
-            renderReplayPage()
+            renderRemoteHostPage(),
+            renderRemoteJoinPage(),
+            renderRemoteWaitPage()
         }, &active_index);
 
-        screen_state->screen.Loop(container);
+        auto root = CatchEvent(container, [this](const Event& event) {
+            if (event == Event::Custom) {
+                return handleNetworkTick();
+            }
+            return false;
+        });
+
+        screen_state->screen.Loop(root);
     }
 
     [[nodiscard]] int boardLimit() const {
@@ -126,7 +195,60 @@ struct Controller::Impl {
         current_y = center;
     }
 
+    void syncCursorToSession() {
+        if (const auto move = session.last_move()) {
+            current_x = move->first;
+            current_y = move->second;
+            return;
+        }
+        centerCursor();
+    }
+
+    void updateRemoteStatus(const std::string& override_text = {}) {
+        if (!override_text.empty()) {
+            remote_status_text_ = override_text;
+            return;
+        }
+
+        if (remote_waiting_for_peer_) {
+            const std::string endpoint = network.localEndpoint().empty()
+                ? ("port " + remote_port_input_)
+                : network.localEndpoint();
+            remote_status_text_ = "Waiting for peer on " + endpoint;
+            return;
+        }
+
+        if (network.isConnected()) {
+            remote_status_text_ = "Remote connected | You: " + stoneText(network.localStone());
+            if (!network.remoteEndpoint().empty()) {
+                remote_status_text_ += " | Peer: " + network.remoteEndpoint();
+            }
+            if (session.status() == gomoku::GameStatus::PLAYING) {
+                remote_status_text_ += network.isLocalTurn()
+                    ? " | Your turn"
+                    : " | Opponent turn";
+            }
+            return;
+        }
+
+        if (!network.lastError().empty()) {
+            remote_status_text_ = "Remote error: " + network.lastError();
+            return;
+        }
+
+        remote_status_text_ = "Remote session idle";
+    }
+
+    void shutdownRemoteSession() {
+        network.disconnect();
+        remote_mode_ = false;
+        remote_waiting_for_peer_ = false;
+        remote_status_text_.clear();
+        show_save_menu_ = false;
+    }
+
     void startGame(const gomoku::SessionMode next_mode) {
+        shutdownRemoteSession();
         session.start(next_mode);
         centerCursor();
 
@@ -135,212 +257,141 @@ struct Controller::Impl {
         } else {
             active_index = kPvpTab;
         }
-
-        if (settings_timer_enabled) {
-            startTimer();
-        }
     }
 
     void backToMenu() {
-        stopTimer();
-        consecutive_timeouts_ = 0;
+        shutdownRemoteSession();
         session.reset();
         active_index = kMenuTab;
         current_x = 0;
         current_y = 0;
     }
 
-    void stopReplayAuto() {
-        replay_auto_ = false;
-        replay_auto_stop_.store(true);
-        if (replay_auto_thread_.joinable()) {
-            replay_auto_thread_.join();
-        }
+    void openRemoteHostPage() {
+        shutdownRemoteSession();
+        session.start(gomoku::SessionMode::PVP);
+        centerCursor();
+        remote_status_text_ = "Choose a port and start hosting.";
+        active_index = kRemoteHostTab;
     }
 
-    void startReplayAuto() {
-        stopReplayAuto();
-        replay_auto_ = true;
-        replay_auto_stop_.store(false);
-        replay_auto_thread_ = std::thread([this] {
-            while (!replay_auto_stop_.load()) {
-                for (int i = 0; i < 10 && !replay_auto_stop_.load(); ++i) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                }
-                if (!replay_auto_stop_.load()) {
-                    screen_state->screen.PostEvent(Event::Special("replay_tick"));
-                }
-            }
-        });
+    void openRemoteJoinPage() {
+        shutdownRemoteSession();
+        session.start(gomoku::SessionMode::PVP);
+        centerCursor();
+        remote_status_text_ = "Enter the host IP and port.";
+        active_index = kRemoteJoinTab;
     }
 
-    void stopTimer() {
-        timer_stop_.store(true);
-        if (timer_thread_.joinable()) {
-            timer_thread_.join();
-        }
-        timer_remaining_ = 0;
-    }
-
-    void startTimer() {
-        stopTimer();
-        int secs = 20;
-        try { secs = std::stoi(settings_timer_seconds_str_); } catch (...) {}
-        if (secs <= 0) secs = 20;
-        timer_remaining_ = secs;
-        timer_stop_.store(false);
-        timer_thread_ = std::thread([this] {
-            while (!timer_stop_.load()) {
-                for (int i = 0; i < 10 && !timer_stop_.load(); ++i) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                if (!timer_stop_.load()) {
-                    screen_state->screen.PostEvent(Event::Special("timer_tick"));
-                }
-            }
-        });
-    }
-
-    void handleTimerTimeout(const bool has_ai) {
-        if (session.status() != gomoku::GameStatus::PLAYING) return;
-        session.skipTurn();
-        ++consecutive_timeouts_;
-
-        if (has_ai && session.status() == gomoku::GameStatus::PLAYING) {
-            runAiTurn();
-        }
-
-        if (consecutive_timeouts_ >= 3) {
-            consecutive_timeouts_ = 0;
-            stopTimer();
-            show_save_menu_ = true;
-            save_menu_selected_ = 0;
-            return;
-        }
-
-        if (settings_timer_enabled && session.status() == gomoku::GameStatus::PLAYING) {
-            startTimer();
-        }
-    }
-
-    void enterReplay() {
-        stopReplayAuto();
-        replay_history_ = session.move_history();
-        replay_step_    = static_cast<int>(replay_history_.size());
-        active_index    = kReplayTab;
-    }
-
-    [[nodiscard]] Element renderReplayGrid() const {
-        const int board_size = session.board().getSize();
-        const int max_step   = static_cast<int>(replay_history_.size());
-
-        std::unordered_map<int, int> pos_to_step;
-        pos_to_step.reserve(replay_step_);
-        for (int i = 0; i < replay_step_; ++i) {
-            const auto [x, y] = replay_history_[i];
-            pos_to_step[y * board_size + x] = i + 1;
-        }
-
-        auto status_bar = text("Replay  Step " + std::to_string(replay_step_) +
-                               " / " + std::to_string(max_step))
-                          | hcenter | bold | color(Color::Cyan);
-
-        Elements rows;
-        for (int y = 0; y < board_size; ++y) {
-            Elements columns;
-            for (int x = 0; x < board_size; ++x) {
-                const auto it = pos_to_step.find(y * board_size + x);
-                Element cell;
-                if (it != pos_to_step.end()) {
-                    const int  step     = it->second;
-                    const bool is_black = (step % 2 == 1);
-                    const auto s        = std::to_string(step);
-                    std::string padded;
-                    if (s.size() == 1)      padded = "  " + s + "  ";
-                    else if (s.size() == 2) padded = " "  + s + "  ";
-                    else                    padded = s    + "  ";
-                    cell = text(padded)
-                           | color(is_black ? Color::Red : Color::White)
-                           | bold;
-                } else {
-                    cell = text("  +  ")
-                           | color(Color::GrayDark);
-                }
-                columns.push_back(std::move(cell));
-            }
-            rows.push_back(hbox(std::move(columns)));
-        }
-
-        auto bottom_bar = hbox({
-            text(" [R Rewind] ") | bold,
-            filler(),
-            text(" [<- Prev] ") | (replay_step_ > 0 ? bold : dim),
-            filler(),
-            replay_auto_
-                ? (text(" [Space Stop] ") | color(Color::Green) | bold)
-                : (text(" [Space Play] ") | bold),
-            filler(),
-            text(" [Next ->] ") | (replay_step_ < max_step ? bold : dim),
-            filler(),
-            text(" [Esc Back] ") | bold,
-        });
-
-        return vbox({
-            status_bar,
-            separator(),
-            vbox(std::move(rows)) | hcenter,
-            separator(),
-            bottom_bar
-        }) | border | center;
-    }
-
-    Component renderReplayPage() {
-        auto component = std::make_shared<InteractiveBoard>();
-        component->render_logic = [this] { return renderReplayGrid(); };
-        component->event_logic  = [this](const Event& event) {
-            const int max_step = static_cast<int>(replay_history_.size());
-
-            if (event == Event::Special("replay_tick")) {
-                if (replay_auto_ && replay_step_ < max_step) {
-                    ++replay_step_;
-                    if (replay_step_ == max_step) {
-                        stopReplayAuto();
-                    }
-                }
-                return true;
-            }
-            if (event == Event::Escape) {
-                stopReplayAuto();
-                result_selected_ = 0;
-                active_index = kResultTab;
-                return true;
-            }
-            if (event == Event::ArrowLeft) {
-                if (replay_step_ > 0) --replay_step_;
-                return true;
-            }
-            if (event == Event::ArrowRight) {
-                if (replay_step_ < max_step) ++replay_step_;
-                return true;
-            }
-            if (event == Event::Character('r') || event == Event::Character('R')) {
-                replay_step_ = 0;
-                stopReplayAuto();
-                startReplayAuto();
-                return true;
-            }
-            if (event == Event::Character(' ')) {
-                if (replay_auto_) {
-                    stopReplayAuto();
-                } else {
-                    startReplayAuto();
-                }
-                return true;
-            }
+    bool beginHosting() {
+        const auto port = parsePortValue(remote_port_input_);
+        if (!port) {
+            updateRemoteStatus("Port must be between 1 and 65535.");
             return false;
-        };
+        }
 
-        return component;
+        network.disconnect();
+        session.start(gomoku::SessionMode::PVP);
+        centerCursor();
+        remote_mode_ = true;
+        remote_waiting_for_peer_ = true;
+
+        if (!network.openHost(*port)) {
+            remote_mode_ = false;
+            remote_waiting_for_peer_ = false;
+            updateRemoteStatus("Host failed: " + network.lastError());
+            return false;
+        }
+
+        updateRemoteStatus();
+        active_index = kRemoteWaitTab;
+        return true;
+    }
+
+    bool beginJoin() {
+        const std::string host = trimCopy(remote_host_input_);
+        if (host.empty()) {
+            updateRemoteStatus("Host IP or hostname cannot be empty.");
+            return false;
+        }
+
+        const auto port = parsePortValue(remote_port_input_);
+        if (!port) {
+            updateRemoteStatus("Port must be between 1 and 65535.");
+            return false;
+        }
+
+        network.disconnect();
+        session.start(gomoku::SessionMode::PVP);
+        centerCursor();
+        remote_mode_ = true;
+        remote_waiting_for_peer_ = false;
+
+        if (!network.connectTo(host, *port)) {
+            remote_mode_ = false;
+            updateRemoteStatus("Join failed: " + network.lastError());
+            return false;
+        }
+
+        updateRemoteStatus();
+        syncCursorToSession();
+        active_index = kPvpTab;
+        handleNetworkTick();
+        return true;
+    }
+
+    bool handleNetworkTick() {
+        bool changed = false;
+
+        if (remote_mode_ && remote_waiting_for_peer_) {
+            if (network.waitForPeer(std::chrono::milliseconds{0})) {
+                remote_waiting_for_peer_ = false;
+                updateRemoteStatus();
+                syncCursorToSession();
+                active_index = kPvpTab;
+                changed = true;
+            } else if (!network.lastError().empty()) {
+                updateRemoteStatus();
+                changed = true;
+            }
+        }
+
+        if (remote_mode_ && !remote_waiting_for_peer_ && network.isConnected()) {
+            const auto previous_move_count = session.move_history().size();
+            const auto previous_status = session.status();
+            const bool handled = network.pump(std::chrono::milliseconds{0});
+
+            if (handled ||
+                previous_move_count != session.move_history().size() ||
+                previous_status != session.status()) {
+                syncCursorToSession();
+                updateRemoteStatus();
+                changed = true;
+            } else if (!network.lastError().empty()) {
+                updateRemoteStatus();
+                changed = true;
+            }
+        } else if (remote_mode_ && !remote_waiting_for_peer_ && !network.isConnected() && !network.lastError().empty()) {
+            updateRemoteStatus();
+            changed = true;
+        }
+
+        if (remote_mode_) {
+            if (session.status() != gomoku::GameStatus::PLAYING &&
+                active_index != kResultTab &&
+                active_index != kRemoteWaitTab) {
+                active_index = kResultTab;
+                changed = true;
+            }
+
+            if (session.status() == gomoku::GameStatus::PLAYING && active_index == kResultTab) {
+                active_index = kPvpTab;
+                syncCursorToSession();
+                changed = true;
+            }
+        }
+
+        return changed;
     }
 
     void refreshSavesList() {
@@ -366,7 +417,7 @@ struct Controller::Impl {
                     separator(),
                     text("No saves found in: " + session.saves_dir()) | dim | hcenter,
                     separator(),
-                    text("Esc  Back to menu") | dim | hcenter
+                    text("Esc Back to menu") | dim | hcenter
                 }) | border | center;
             }
 
@@ -375,7 +426,9 @@ struct Controller::Impl {
                 namespace fs = std::filesystem;
                 auto label = fs::path(save_files_[i]).stem().string();
                 auto item = text("  " + label + "  ");
-                if (i == load_selected_) item |= inverted;
+                if (i == load_selected_) {
+                    item |= inverted;
+                }
                 items.push_back(item);
             }
 
@@ -384,7 +437,7 @@ struct Controller::Impl {
                 separator(),
                 vbox(std::move(items)),
                 separator(),
-                text("↑↓ Select  Enter Load  Esc Back") | dim | hcenter
+                text("Arrow keys Select  Enter Load  Esc Back") | dim | hcenter
             }) | border | center;
         };
 
@@ -394,21 +447,23 @@ struct Controller::Impl {
                 return true;
             }
             if (event == Event::ArrowUp) {
-                if (!save_files_.empty())
+                if (!save_files_.empty()) {
                     load_selected_ = std::max(0, load_selected_ - 1);
+                }
                 return true;
             }
             if (event == Event::ArrowDown) {
-                if (!save_files_.empty())
+                if (!save_files_.empty()) {
                     load_selected_ = std::min(static_cast<int>(save_files_.size()) - 1, load_selected_ + 1);
+                }
                 return true;
             }
             if (event == Event::Return && !save_files_.empty()) {
+                shutdownRemoteSession();
                 if (session.deserialize(save_files_[load_selected_])) {
-                    centerCursor();
+                    syncCursorToSession();
                     active_index = (session.mode() == gomoku::SessionMode::PVE) ? kPveTab : kPvpTab;
                     if (session.status() != gomoku::GameStatus::PLAYING) {
-                        result_selected_ = 0;
                         active_index = kResultTab;
                     }
                 }
@@ -437,28 +492,28 @@ struct Controller::Impl {
         }
         if (event == Event::Return) {
             switch (save_menu_selected_) {
-                case 0: // Save & Leave
+                case 0:
                     session.serialize();
                     show_save_menu_ = false;
                     backToMenu();
                     break;
-                case 1: // Save
-                    if (!session.serialize().empty()) {
-                        setStatusMsg("Game saved!", 1500);
-                    }
+                case 1:
+                    session.serialize();
                     show_save_menu_ = false;
                     break;
-                case 2: // Leave
+                case 2:
                     show_save_menu_ = false;
                     backToMenu();
                     break;
-                case 3: // Cancel
+                case 3:
                     show_save_menu_ = false;
+                    break;
+                default:
                     break;
             }
             return true;
         }
-        return true; // absorb all keys while submenu is open
+        return true;
     }
 
     bool handleCursorMove(const Event& event) {
@@ -484,7 +539,6 @@ struct Controller::Impl {
 
     void tryMoveToResult() {
         if (session.status() != gomoku::GameStatus::PLAYING) {
-            result_selected_ = 0;
             active_index = kResultTab;
         }
     }
@@ -494,25 +548,9 @@ struct Controller::Impl {
             return false;
         }
 
-        if (const auto move = session.last_move()) {
-            current_x = move->first;
-            current_y = move->second;
-        }
-
+        syncCursorToSession();
         tryMoveToResult();
         return true;
-    }
-
-    void setStatusMsg(const std::string& msg, int ms = 1500) {
-        status_msg_ = msg;
-        status_msg_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
-    }
-
-    [[nodiscard]] std::string activeStatusMsg() const {
-        if (!status_msg_.empty() && std::chrono::steady_clock::now() < status_msg_until_) {
-            return status_msg_;
-        }
-        return {};
     }
 
     Component renderFrontPage() {
@@ -534,32 +572,32 @@ struct Controller::Impl {
             }
 
             if (menu_selected == 0) {
-                pending_mode_ = gomoku::SessionMode::PVP;
-                settings_focus_ = 1;
-                previous_tab = kMenuTab;
-                active_index = kSetupTab;
+                startGame(gomoku::SessionMode::PVP);
                 return true;
             }
             if (menu_selected == 1) {
-                pending_mode_ = gomoku::SessionMode::PVE;
-                settings_focus_ = 1;
-                previous_tab = kMenuTab;
-                active_index = kSetupTab;
+                startGame(gomoku::SessionMode::PVE);
                 return true;
             }
             if (menu_selected == 2) {
-                pending_mode_.reset();
-                settings_focus_ = 0;
-                previous_tab = kMenuTab;
-                active_index = kSetupTab;
+                openRemoteHostPage();
                 return true;
             }
             if (menu_selected == 3) {
+                openRemoteJoinPage();
+                return true;
+            }
+            if (menu_selected == 4) {
+                previous_tab = kMenuTab;
+                active_index = kSettingsTab;
+                return true;
+            }
+            if (menu_selected == 5) {
                 refreshSavesList();
                 active_index = kLoadTab;
                 return true;
             }
-            if (menu_selected == 4) {
+            if (menu_selected == 6) {
                 screen_state->screen.Exit();
                 return true;
             }
@@ -574,19 +612,6 @@ struct Controller::Impl {
         auto component = std::make_shared<InteractiveBoard>();
         component->render_logic = [this] { return renderGrid(); };
         component->event_logic = [this, has_ai](const Event& event) {
-            if (event == Event::Special("timer_tick")) {
-                if (settings_timer_enabled && !show_save_menu_ &&
-                    session.status() == gomoku::GameStatus::PLAYING) {
-                    if (timer_remaining_ > 0) {
-                        --timer_remaining_;
-                    }
-                    if (timer_remaining_ == 0) {
-                        handleTimerTimeout(has_ai);
-                    }
-                }
-                return true;
-            }
-
             if (show_save_menu_) {
                 return handleSaveMenuEvent(event);
             }
@@ -595,32 +620,47 @@ struct Controller::Impl {
                 return true;
             }
 
+            if (remote_mode_ && (event == Event::Character('q') || event == Event::Character('Q'))) {
+                backToMenu();
+                return true;
+            }
+
             if (event == Event::Character('l') || event == Event::Character('L')) {
+                if (remote_mode_) {
+                    updateRemoteStatus("Save/leave is disabled during remote games. Press Q to disconnect.");
+                    return true;
+                }
                 show_save_menu_ = true;
                 save_menu_selected_ = 0;
                 return true;
             }
 
             if (event == Event::Character('s') || event == Event::Character('S')) {
-                pending_mode_.reset();
-                settings_focus_ = 0;
                 previous_tab = active_index;
-                active_index = kSetupTab;
+                active_index = kSettingsTab;
                 return true;
             }
 
             if (event == Event::Character('u') || event == Event::Character('U')) {
                 if (!settings_undo_enabled) {
-                    setStatusMsg("Undo is disabled (enable in Setup)", 2000);
-                } else if (!session.undo()) {
-                    setStatusMsg("No moves to undo", 1500);
-                } else {
-                    setStatusMsg("Move undone", 1000);
-                    if (settings_timer_enabled &&
-                        session.status() == gomoku::GameStatus::PLAYING) {
-                        startTimer();
-                    }
+                    return true;
                 }
+
+                if (remote_mode_) {
+                    if (!network.requestUndo()) {
+                        updateRemoteStatus("Undo failed: " + network.lastError());
+                        return true;
+                    }
+                    syncCursorToSession();
+                    updateRemoteStatus();
+                    if (session.status() == gomoku::GameStatus::PLAYING && active_index == kResultTab) {
+                        active_index = kPvpTab;
+                    }
+                    return true;
+                }
+
+                session.undo();
+                syncCursorToSession();
                 return true;
             }
 
@@ -628,19 +668,32 @@ struct Controller::Impl {
                 return false;
             }
 
-            if (!session.human_move(current_x, current_y)) {
-                setStatusMsg("Cell already occupied", 1500);
+            if (remote_mode_) {
+                if (!network.isConnected()) {
+                    updateRemoteStatus("Remote peer is not connected.");
+                    return true;
+                }
+                if (!network.isLocalTurn()) {
+                    updateRemoteStatus("Waiting for the remote player's move.");
+                    return true;
+                }
+                if (!network.sendLocalMove(current_x, current_y)) {
+                    updateRemoteStatus("Move failed: " + network.lastError());
+                    return true;
+                }
+                syncCursorToSession();
+                updateRemoteStatus();
+                tryMoveToResult();
                 return true;
             }
 
-            consecutive_timeouts_ = 0;
-            stopTimer();
+            if (!session.human_move(current_x, current_y)) {
+                return false;
+            }
+
             tryMoveToResult();
             if (has_ai && session.status() == gomoku::GameStatus::PLAYING) {
                 runAiTurn();
-            }
-            if (settings_timer_enabled && session.status() == gomoku::GameStatus::PLAYING) {
-                startTimer();
             }
 
             return true;
@@ -649,183 +702,227 @@ struct Controller::Impl {
         return component;
     }
 
-    Component renderSetupPage() {
+    Component renderSettingsPage() {
         CheckboxOption cb_opt;
-        cb_opt.transform = [](const EntryState& s) {
-            auto prefix = text(s.state ? "[x] " : "[ ] ");
-            auto label  = text(s.label);
-            if (s.focused) { prefix |= inverted; label |= inverted; }
+        cb_opt.transform = [](const EntryState& state) {
+            auto prefix = text(state.state ? "[x] " : "[ ] ");
+            auto label = text(state.label);
+            if (state.focused) {
+                prefix |= inverted;
+                label |= inverted;
+            }
             return hbox({prefix, label}) | flex;
         };
 
-        auto undo_checkbox  = Checkbox("Undo", &settings_undo_enabled, cb_opt);
-        auto timer_checkbox = Checkbox("Time Limit", &settings_timer_enabled, cb_opt);
-
-        InputOption inp_opt = InputOption::Default();
-        inp_opt.on_change = [this] {
-            std::string filtered;
-            for (const char c : settings_timer_seconds_str_) {
-                if (c >= '0' && c <= '9') filtered += c;
-            }
-            if (filtered.size() > 3) filtered.resize(3);
-            settings_timer_seconds_str_ = filtered;
-        };
-        auto timer_input = Input(&settings_timer_seconds_str_, "secs", inp_opt);
+        auto undo_checkbox = Checkbox("Undo", &settings_undo_enabled, cb_opt);
+        auto timer_checkbox = Checkbox("Move Timer", &settings_timer_enabled, cb_opt);
 
         ButtonOption btn_opt;
-        btn_opt.transform = [](const EntryState& s) {
-            auto e = text(s.label) | flex;
-            if (s.focused) e |= inverted;
-            return e;
-        };
-        auto back_button = Button("Ok", [this] {
-            if (pending_mode_.has_value()) {
-                auto mode = *pending_mode_;
-                pending_mode_.reset();
-                startGame(mode);
-            } else {
-                active_index = previous_tab;
+        btn_opt.transform = [](const EntryState& state) {
+            auto element = text(state.label) | flex;
+            if (state.focused) {
+                element |= inverted;
             }
-        }, btn_opt);
+            return element;
+        };
+        auto back_button = Button("Back", [this] { active_index = previous_tab; }, btn_opt);
 
-        auto checkboxes = Container::Vertical({ undo_checkbox, timer_checkbox, timer_input });
-        auto container  = Container::Vertical({ checkboxes, back_button }, &settings_focus_);
+        auto checkboxes = Container::Vertical({undo_checkbox, timer_checkbox});
+        auto container = Container::Vertical({checkboxes, back_button});
 
-        return Renderer(container, [this, undo_checkbox, timer_checkbox, timer_input, back_button] {
-            auto timer_row = hbox({
-                text("    "),
-                timer_input->Render() | size(WIDTH, EQUAL, 4),
-                text(" sec")
-            });
-            if (!settings_timer_enabled) timer_row = timer_row | dim;
-
-            auto how_to_play = vbox({
-                text("\u2500\u2500 How to Play \u2500\u2500") | bold | color(Color::Cyan),
-                text("\u00b7 Get 5 in a row to win") | dim,
-                text("  (horizontal / vertical / diagonal)") | dim,
-                text("\u00b7 Black \u25cb goes first, alternate") | dim,
-                text(""),
-                text("\u2191\u2193\u2190\u2192 Move   Enter/Space Place") | dim,
-                text("U Undo   S Setup   L Save/Leave") | dim,
-            });
-
-            auto setup_box = vbox({
-                text("\u2500\u2500 Setup \u2500\u2500") | bold | color(Color::Cyan),
-                undo_checkbox->Render(),
-                hbox({ timer_checkbox->Render(), timer_row }),
-            });
-
-            auto settings_box = vbox({
-                text("Briefing") | hcenter | bold | color(Color::Cyan),
+        return Renderer(container, [checkboxes, back_button, this] {
+            Elements content = {
+                text("Settings") | hcenter | bold | color(Color::Cyan),
                 separator(),
-                how_to_play,
-                separator(),
-                setup_box,
+                checkboxes->Render(),
                 separator(),
                 back_button->Render()
-            }) | border | center;
+            };
 
-            return dbox({ renderGrid(), settings_box | clear_under | center });
+            if (remote_mode_) {
+                content.push_back(separator());
+                content.push_back(text(remote_status_text_) |
+                                  color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_)) |
+                                  hcenter);
+            }
+
+            return vbox(std::move(content)) | border | center;
         });
     }
 
     Component renderEndPage() {
-        auto component = std::make_shared<InteractiveBoard>();
-
-        component->render_logic = [this] {
-            const std::vector<std::string> result_labels = {
-                "Back to menu", "Play again", "View Replay"
-            };
-            Elements items;
-            for (int i = 0; i < static_cast<int>(result_labels.size()); ++i) {
-                auto item = text("  " + result_labels[i] + "  ");
-                if (i == result_selected_) item |= inverted;
-                items.push_back(std::move(item));
+        auto back_button = Button("Back to menu", [this] { backToMenu(); });
+        auto play_again_button = Button("Play again", [this] {
+            if (remote_mode_) {
+                if (!network.isConnected()) {
+                    updateRemoteStatus("Remote peer is not connected.");
+                    return;
+                }
+                if (!network.requestReset()) {
+                    updateRemoteStatus("Reset failed: " + network.lastError());
+                    return;
+                }
+                syncCursorToSession();
+                updateRemoteStatus();
+                active_index = kPvpTab;
+                return;
             }
-            auto result_box = vbox({
+            startGame(session.mode());
+        });
+
+        auto container = Container::Vertical({back_button, play_again_button});
+
+        return Renderer(container, [container, this] {
+            Elements content = {
                 text("Game Over") | hcenter | bold | color(Color::Red),
                 separator(),
                 text("Result: " + gameResultText(session.status())) | hcenter | color(Color::Yellow),
-                separator(),
-                vbox(std::move(items)),
-                separator(),
-                text("↑↓ Move  Enter Confirm") | dim | hcenter
-            }) | border | center;
-            return dbox({ renderGrid(), result_box | clear_under | center });
-        };
+                separator()
+            };
 
-        component->event_logic = [this](const Event& event) {
-            constexpr int kNumOptions = 3;
-            if (event == Event::ArrowUp) {
-                result_selected_ = (result_selected_ - 1 + kNumOptions) % kNumOptions;
-                return true;
+            if (remote_mode_) {
+                content.push_back(text(remote_status_text_) |
+                                  color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_)) |
+                                  hcenter);
+                content.push_back(separator());
             }
-            if (event == Event::ArrowDown) {
-                result_selected_ = (result_selected_ + 1) % kNumOptions;
-                return true;
-            }
-            if (event == Event::Return) {
-                if (result_selected_ == 0) backToMenu();
-                else if (result_selected_ == 1) startGame(session.mode());
-                else enterReplay();
+
+            content.push_back(container->Render() | hcenter);
+            return vbox(std::move(content)) | border | center;
+        });
+    }
+
+    Component renderRemoteHostPage() {
+        auto port_input = Input(&remote_port_input_, "7777");
+        auto start_button = Button("Start Hosting", [this] { beginHosting(); });
+        auto back_button = Button("Back", [this] { backToMenu(); });
+
+        auto container = Container::Vertical({port_input, start_button, back_button});
+        auto component = Renderer(container, [port_input, start_button, back_button, this] {
+            return vbox({
+                text("Host Remote Game") | hcenter | bold | color(Color::Cyan),
+                separator(),
+                text("Port") | bold,
+                port_input->Render() | border,
+                separator(),
+                text(remote_status_text_) |
+                    color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_)) |
+                    hcenter,
+                separator(),
+                start_button->Render(),
+                back_button->Render()
+            }) | border | center;
+        });
+
+        component |= CatchEvent([this](const Event& event) {
+            if (event == Event::Escape) {
+                backToMenu();
                 return true;
             }
             return false;
-        };
+        });
+
+        return component;
+    }
+
+    Component renderRemoteJoinPage() {
+        auto host_input = Input(&remote_host_input_, "127.0.0.1");
+        auto port_input = Input(&remote_port_input_, "7777");
+        auto connect_button = Button("Connect", [this] { beginJoin(); });
+        auto back_button = Button("Back", [this] { backToMenu(); });
+
+        auto container = Container::Vertical({host_input, port_input, connect_button, back_button});
+        auto component = Renderer(container, [host_input, port_input, connect_button, back_button, this] {
+            return vbox({
+                text("Join Remote Game") | hcenter | bold | color(Color::Cyan),
+                separator(),
+                text("Host") | bold,
+                host_input->Render() | border,
+                separator(),
+                text("Port") | bold,
+                port_input->Render() | border,
+                separator(),
+                text(remote_status_text_) |
+                    color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_)) |
+                    hcenter,
+                separator(),
+                connect_button->Render(),
+                back_button->Render()
+            }) | border | center;
+        });
+
+        component |= CatchEvent([this](const Event& event) {
+            if (event == Event::Escape) {
+                backToMenu();
+                return true;
+            }
+            return false;
+        });
+
+        return component;
+    }
+
+    Component renderRemoteWaitPage() {
+        auto cancel_button = Button("Cancel", [this] { backToMenu(); });
+        auto component = Renderer(cancel_button, [cancel_button, this] {
+            return vbox({
+                text("Waiting For Remote Player") | hcenter | bold | color(Color::Cyan),
+                separator(),
+                text(remote_status_text_) |
+                    color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_)) |
+                    hcenter,
+                separator(),
+                text("Share this address with the other player:") | hcenter,
+                text(network.localEndpoint().empty() ? ("port " + remote_port_input_) : network.localEndpoint()) |
+                    bold |
+                    hcenter,
+                separator(),
+                cancel_button->Render() | hcenter,
+                text("Esc Cancel") | dim | hcenter
+            }) | border | center;
+        });
+
+        component |= CatchEvent([this](const Event& event) {
+            if (event == Event::Escape) {
+                backToMenu();
+                return true;
+            }
+            return false;
+        });
 
         return component;
     }
 
     [[nodiscard]] Element renderGrid() const {
         const auto& board = session.board();
-
-        // Top info bar: Mode (left) | Timer status (right)
-        const std::string mode_str = "Mode: " + std::string(active_index == kPveTab ? "PvE" : "PvP");
-        Element timer_status;
-        if (!settings_timer_enabled) {
-            timer_status = text("Timer Off") | dim;
-        } else {
-            const bool urgent = (timer_remaining_ <= 10);
-            timer_status = hbox({
-                text("Time remaining: "),
-                text(std::to_string(timer_remaining_) + "s") | bold |
-                    color(urgent ? Color::Red : Color::Yellow)
-            });
-        }
-        auto info_bar = hbox({ text(" " + mode_str), filler(), timer_status, text(" ") });
-
-        // Current player bar
         const bool is_black_turn = board.getCurrentPlayer() == gomoku::Stone::BLACK;
-        auto player_bar = text(is_black_turn ? "Current player: Black" : "Current player: White") |
-                          bold | color(is_black_turn ? Color::Red : Color::White) | hcenter;
+        auto status_bar = text(is_black_turn ? "Current player: Black" : "Current player: White") |
+                          bold |
+                          color(is_black_turn ? Color::Red : Color::White) |
+                          hcenter;
 
-        // AI status bar
-        auto ai_bar = text(session.ai_status_text()) | hcenter;
+        Element info_bar = text("Local PvP") | dim | hcenter;
         if (active_index == kPveTab) {
-            ai_bar |= session.ai_used_fallback() ? color(Color::Yellow) : color(Color::Green);
-        } else {
-            ai_bar |= dim;
+            info_bar = text(session.ai_status_text()) | hcenter;
+            info_bar |= session.ai_used_fallback() ? color(Color::Yellow) : color(Color::Green);
+        } else if (remote_mode_) {
+            info_bar = text(remote_status_text_) | hcenter;
+            info_bar |= color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_));
         }
 
         Elements rows;
         const int size = board.getSize();
-        const bool in_game = (active_index == kPvpTab || active_index == kPveTab);
-        const auto last_mv = session.last_move();
         for (int y = 0; y < size; ++y) {
             Elements columns;
             for (int x = 0; x < size; ++x) {
                 const auto stone = board.getStone(x, y);
                 auto cell = stoneCellElement(stone);
 
-                const bool is_last_move = last_mv.has_value() && last_mv->first == x && last_mv->second == y;
-
-                if (x == current_x && y == current_y && !show_save_menu_ && in_game) {
-                    cell |= bgcolor(Color::Blue);
-                } else if (is_last_move && in_game) {
+                if (x == current_x && y == current_y) {
                     if (stone == gomoku::Stone::WHITE) {
-                        cell |= bgcolor(Color::GrayDark) | underlined;
+                        cell |= underlined;
                     } else {
-                        cell |= bgcolor(Color::GrayDark);
+                        cell |= bgcolor(Color::Blue);
                     }
                 }
 
@@ -834,35 +931,28 @@ struct Controller::Impl {
             rows.push_back(hbox(std::move(columns)));
         }
 
-        // Hint line: urgent timer > timed status message > default controls
-        Element hint_line;
-        if (settings_timer_enabled && timer_remaining_ > 0 && timer_remaining_ <= 3) {
-            hint_line = text("  Hurry up!  ") | bold | color(Color::Red) | hcenter;
-        } else {
-            const auto msg = activeStatusMsg();
-            if (!msg.empty()) {
-                hint_line = text("  " + msg + "  ") | color(Color::Yellow) | hcenter;
-            } else {
-                hint_line = text("↑↓←→ Move  Enter/Space Place  |  S Setup  U Undo  L Save") | dim | hcenter;
-            }
-        }
-
-        auto bottom_bar = hbox({
-            text(" [Setup(S)] ") | bold,
-            filler(),
-            text(" [Undo(U)] ") | (settings_undo_enabled ? bold : dim),
-            filler(),
-            text(" [Save/Leave(L)] ") | bold,
-        });
+        auto bottom_bar = remote_mode_
+            ? hbox({
+                text(" [Setting(S)] ") | bold,
+                filler(),
+                text(" [Undo(U)] ") | (settings_undo_enabled ? bold : dim),
+                filler(),
+                text(" [Disconnect(Q)] ") | bold
+            })
+            : hbox({
+                text(" [Setting(S)] ") | bold,
+                filler(),
+                text(" [Undo(U)] ") | (settings_undo_enabled ? bold : dim),
+                filler(),
+                text(" [Save/Leave(L)] ") | bold
+            });
 
         auto board_element = vbox({
+            status_bar,
             info_bar,
-            player_bar,
-            ai_bar,
             separator(),
             vbox(std::move(rows)) | hcenter,
             separator(),
-            hint_line,
             bottom_bar
         }) | border | center;
 
@@ -891,19 +981,23 @@ struct Controller::Impl {
             separator(),
             vbox(std::move(menu_items)),
             separator(),
-            text("↑↓ Move  Enter Confirm  Esc Cancel") | dim | hcenter
+            text("Arrow keys Move  Enter Confirm  Esc Cancel") | dim | hcenter
         }) | border | bgcolor(Color::Black) | center;
 
-        return dbox({ board_element, overlay | clear_under | center });
+        return dbox({board_element, overlay | center});
     }
 
     gomoku::GameSession& session;
+    gomoku::webConnect network;
     std::unique_ptr<ScreenState> screen_state;
+    std::jthread ui_tick_;
 
     std::vector<std::string> menu_entries = {
         "Start Game (PvP)",
         "Start Game (PvE)",
-        "Setup",
+        "Host Remote Game",
+        "Join Remote Game",
+        "Settings",
         "Load Game",
         "Exit"
     };
@@ -914,38 +1008,20 @@ struct Controller::Impl {
     int current_x = 0;
     int current_y = 0;
 
-    // Setup state (wired up in Phase C / Phase F)
-    bool settings_undo_enabled  = true;
+    bool settings_undo_enabled = true;
     bool settings_timer_enabled = false;
-    int  settings_focus_        = 0;
-    std::optional<gomoku::SessionMode> pending_mode_;
 
-    // Move timer state
-    std::string         settings_timer_seconds_str_ = "20";
-    int                 timer_remaining_ = 0;
-    int                 consecutive_timeouts_ = 0;
-    std::atomic<bool>   timer_stop_{true};
-    std::thread         timer_thread_;
+    bool show_save_menu_ = false;
+    int save_menu_selected_ = 0;
 
-    // Save/Leave submenu state
-    bool show_save_menu_     = false;
-    int  save_menu_selected_ = 0;
-    int  result_selected_    = 0;
-
-    // Status hint message (transient, time-based)
-    std::string status_msg_;
-    std::chrono::steady_clock::time_point status_msg_until_{};
-
-    // Load Game page state
     std::vector<std::string> save_files_;
     int load_selected_ = 0;
 
-    // Replay page state
-    std::vector<std::pair<int,int>> replay_history_;
-    int                replay_step_ = 0;
-    bool               replay_auto_ = false;
-    std::atomic<bool>  replay_auto_stop_{true};
-    std::thread        replay_auto_thread_;
+    bool remote_mode_ = false;
+    bool remote_waiting_for_peer_ = false;
+    std::string remote_status_text_;
+    std::string remote_host_input_ = "127.0.0.1";
+    std::string remote_port_input_ = "7777";
 };
 
 Controller::Controller(gomoku::GameSession& session)
