@@ -747,6 +747,22 @@ struct Controller::Impl {
         return component;
     }
 
+    bool trySaveSessionWithFeedback() {
+        if (const std::string save_path = session.serialize(); !save_path.empty()) {
+            clearLocalStatus();
+            setStatusMsg("Game saved!", 1500);
+            return true;
+        }
+
+        const std::string detail = session.last_persistence_error().empty()
+            ? "Unknown persistence error."
+            : session.last_persistence_error();
+        const std::string message = "Save failed: " + detail;
+        setLocalStatus(message);
+        setStatusMsg(message, 3000);
+        return false;
+    }
+
     bool handleSaveMenuEvent(const Event& event) {
         constexpr int kSaveMenuItems = 4;
 
@@ -765,10 +781,9 @@ struct Controller::Impl {
         // Hotkey shortcuts: S for Save (only), L for Leave
         if (event == Event::Character('s') || event == Event::Character('S')) {
             // S key directly executes Save
-            if (!session.serialize().empty()) {
-                setStatusMsg("Game saved!", 1500);
+            if (trySaveSessionWithFeedback()) {
+                show_save_menu_ = false;
             }
-            show_save_menu_ = false;
             return true;
         }
         if (event == Event::Character('l') || event == Event::Character('L')) {
@@ -780,15 +795,15 @@ struct Controller::Impl {
         if (event == Event::Return) {
             switch (save_menu_selected_) {
                 case 0: // Save & Leave
-                    session.serialize();
-                    show_save_menu_ = false;
-                    backToMenu();
+                    if (trySaveSessionWithFeedback()) {
+                        show_save_menu_ = false;
+                        backToMenu();
+                    }
                     break;
                 case 1: // Save
-                    if (!session.serialize().empty()) {
-                        setStatusMsg("Game saved!", 1500);
+                    if (trySaveSessionWithFeedback()) {
+                        show_save_menu_ = false;
                     }
-                    show_save_menu_ = false;
                     break;
                 case 2: // Leave
                     show_save_menu_ = false;
