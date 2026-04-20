@@ -389,6 +389,7 @@ struct webConnect::Impl {
     bool hosting = false;
     bool connected = false;
     bool handshake_complete = false;
+    bool hello_received = false;
     Stone local_stone = Stone::BLACK;
     Stone remote_stone = Stone::WHITE;
     std::string inbound_buffer;
@@ -440,12 +441,17 @@ struct webConnect::Impl {
             session.start(SessionMode::PVP);
             remote_stone = *host_color;
             local_stone = (*host_color == Stone::BLACK) ? Stone::WHITE : Stone::BLACK;
-            handshake_complete = true;
+            hello_received = true;
+            handshake_complete = false;
             last_error.clear();
             return true;
         }
 
         if (command == "READY") {
+            if (!hosting && !hello_received) {
+                last_error = "Received READY before HELLO.";
+                return false;
+            }
             handshake_complete = true;
             last_error.clear();
             return true;
@@ -496,6 +502,13 @@ struct webConnect::Impl {
             payload = trimCopy(std::move(payload));
             if (!applySnapshot(session, move_count, payload, last_error)) {
                 return false;
+            }
+            if (!hosting && !hello_received) {
+                last_error = "Received SNAPSHOT before HELLO.";
+                return false;
+            }
+            if (!hosting) {
+                handshake_complete = true;
             }
             last_error.clear();
             return true;
@@ -568,6 +581,7 @@ bool webConnect::openHost(const std::uint16_t port, const std::string& bind_addr
     impl_->hosting = true;
     impl_->connected = false;
     impl_->handshake_complete = false;
+    impl_->hello_received = false;
     impl_->local_stone = Stone::BLACK;
     impl_->remote_stone = Stone::WHITE;
     impl_->inbound_buffer.clear();
@@ -654,6 +668,7 @@ bool webConnect::connectTo(const std::string& host, const std::uint16_t port) co
     impl_->hosting = false;
     impl_->connected = true;
     impl_->handshake_complete = false;
+    impl_->hello_received = false;
     impl_->local_stone = Stone::WHITE;
     impl_->remote_stone = Stone::BLACK;
     impl_->inbound_buffer.clear();
@@ -680,7 +695,7 @@ bool webConnect::connectTo(const std::string& host, const std::uint16_t port) co
 
     if (!impl_->handshake_complete) {
         if (impl_->last_error.empty()) {
-            impl_->last_error = "Timed out waiting for remote HELLO packet.";
+            impl_->last_error = "Timed out waiting for remote handshake completion.";
         }
         disconnect();
         return false;
@@ -825,6 +840,7 @@ void webConnect::disconnect() const {
     impl_->hosting = false;
     impl_->connected = false;
     impl_->handshake_complete = false;
+    impl_->hello_received = false;
     impl_->inbound_buffer.clear();
     impl_->local_endpoint.clear();
     impl_->remote_endpoint.clear();
