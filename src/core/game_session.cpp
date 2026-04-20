@@ -166,19 +166,36 @@ std::string GameSession::serialize() const {
 
     auto now = std::chrono::system_clock::now();
     auto t   = std::chrono::system_clock::to_time_t(now);
+    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) %
+                        std::chrono::seconds{1};
     std::tm tm_info{};
 #ifdef _WIN32
     localtime_s(&tm_info, &t);
 #else
     localtime_r(&t, &tm_info);
 #endif
-    std::ostringstream name;
-    name << std::put_time(&tm_info, "save_%Y%m%d_%H%M%S.gomoku");
-    const std::string filepath = (fs::path(saves_dir_) / name.str()).string();
+    std::ostringstream base_name;
+    base_name << "save_" << std::put_time(&tm_info, "%Y%m%d_%H%M%S")
+              << '_' << std::setw(3) << std::setfill('0') << millis.count();
 
-    std::ofstream f(filepath);
+    fs::path filepath = fs::path(saves_dir_) / (base_name.str() + ".gomoku");
+    for (int collision_index = 1;; ++collision_index) {
+        if (!fs::exists(filepath, ec)) {
+            break;
+        }
+        if (ec) {
+            last_persistence_error_ = "Failed to check save file collision: " + filepath.string() + " (" + ec.message() + ")";
+            return {};
+        }
+        std::ostringstream collision_name;
+        collision_name << base_name.str() << '_' << collision_index << ".gomoku";
+        filepath = fs::path(saves_dir_) / collision_name.str();
+        ec.clear();
+    }
+
+    std::ofstream f(filepath.string());
     if (!f) {
-        last_persistence_error_ = "Failed to open save file: " + filepath;
+        last_persistence_error_ = "Failed to open save file: " + filepath.string();
         return {};
     }
 
@@ -190,11 +207,11 @@ std::string GameSession::serialize() const {
 
     f.flush();
     if (!f) {
-        last_persistence_error_ = "Failed to write save file: " + filepath;
+        last_persistence_error_ = "Failed to write save file: " + filepath.string();
         return {};
     }
 
-    return filepath;
+    return filepath.string();
 }
 
 bool GameSession::deserialize(const std::string& filepath) {
