@@ -269,9 +269,15 @@ struct Controller::Impl {
         local_status_color_ = color;
     }
 
+    void resetTimeoutState() {
+        consecutive_timeouts_ = 0;
+        stopTimer();
+    }
+
     void startGame(const gomoku::SessionMode next_mode) {
         shutdownRemoteSession();
         clearLocalStatus();
+        resetTimeoutState();
         session.start(next_mode);
         centerCursor();
 
@@ -317,6 +323,7 @@ struct Controller::Impl {
 
     bool beginHosting() {
         clearLocalStatus();
+        resetTimeoutState();
         const auto port = parsePortValue(remote_port_input_);
         if (!port) {
             updateRemoteStatus("Port must be between 1 and 65535.");
@@ -343,6 +350,7 @@ struct Controller::Impl {
 
     bool beginJoin() {
         clearLocalStatus();
+        resetTimeoutState();
         const std::string host = trimCopy(remote_host_input_);
         if (host.empty()) {
             updateRemoteStatus("Host IP or hostname cannot be empty.");
