@@ -19,6 +19,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -293,10 +294,11 @@ bool queryEndpoint(const SocketHandle socket, const bool local, std::string& out
     return stream.str();
 }
 
-bool applySnapshot(GameSession& session, const std::string& encoded_moves, std::string& error) {
-    session.start(SessionMode::PVP);
-
+bool parseSnapshotMoves(const std::string& encoded_moves,
+                        std::vector<std::pair<int, int>>& parsed_moves,
+                        std::string& error) {
     const std::string payload = trimCopy(encoded_moves);
+    parsed_moves.clear();
     if (payload.empty() || payload == "-") {
         return true;
     }
@@ -319,10 +321,7 @@ bool applySnapshot(GameSession& session, const std::string& encoded_moves, std::
             error = "Invalid snapshot coordinates: " + std::string(move);
             return false;
         }
-        if (!session.human_move(x, y, false)) {
-            error = "Snapshot replay rejected move (" + std::to_string(x) + "," + std::to_string(y) + ")";
-            return false;
-        }
+        parsed_moves.emplace_back(x, y);
 
         if (end == std::string::npos) {
             break;
@@ -330,6 +329,34 @@ bool applySnapshot(GameSession& session, const std::string& encoded_moves, std::
         begin = end + 1;
     }
 
+    return true;
+}
+
+bool applySnapshot(GameSession& session,
+                   const std::size_t declared_move_count,
+                   const std::string& encoded_moves,
+                   std::string& error) {
+    std::vector<std::pair<int, int>> parsed_moves;
+    if (!parseSnapshotMoves(encoded_moves, parsed_moves, error)) {
+        return false;
+    }
+
+    if (declared_move_count != parsed_moves.size()) {
+        error = "Snapshot move count mismatch. Declared=" + std::to_string(declared_move_count) +
+                 ", payload=" + std::to_string(parsed_moves.size());
+        return false;
+    }
+
+    GameSession staged(session.board().getSize(), session.saves_dir());
+    staged.start(SessionMode::PVP);
+    for (const auto& [x, y] : parsed_moves) {
+        if (!staged.human_move(x, y, false)) {
+            error = "Snapshot replay rejected move (" + std::to_string(x) + "," + std::to_string(y) + ")";
+            return false;
+        }
+    }
+
+    session = std::move(staged);
     return true;
 }
 
@@ -467,13 +494,7 @@ struct webConnect::Impl {
             std::string payload;
             std::getline(stream, payload);
             payload = trimCopy(std::move(payload));
-            if (!applySnapshot(session, payload, last_error)) {
-                return false;
-            }
-
-            if (move_count != session.move_history().size()) {
-                last_error = "Snapshot move count mismatch. Declared=" + std::to_string(move_count) +
-                             ", applied=" + std::to_string(session.move_history().size());
+            if (!applySnapshot(session, move_count, payload, last_error)) {
                 return false;
             }
             last_error.clear();
