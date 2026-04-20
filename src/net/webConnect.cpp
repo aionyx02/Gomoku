@@ -381,6 +381,13 @@ bool applyRemoteMove(GameSession& session,
     return true;
 }
 
+bool applySnapshotPacket(GameSession& session,
+                         const std::size_t declared_move_count,
+                         const std::string& encoded_moves,
+                         std::string& error) {
+    return applySnapshot(session, declared_move_count, encoded_moves, error);
+}
+
 } // namespace net
 
 struct webConnect::Impl {
@@ -500,7 +507,7 @@ struct webConnect::Impl {
             std::string payload;
             std::getline(stream, payload);
             payload = trimCopy(std::move(payload));
-            if (!applySnapshot(session, move_count, payload, last_error)) {
+            if (!net::applySnapshotPacket(session, move_count, payload, last_error)) {
                 return false;
             }
             if (!hosting && !hello_received) {

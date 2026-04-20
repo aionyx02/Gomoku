@@ -7,6 +7,7 @@
 
 #include "../core/game_session.h"
 
+#include <cstddef>
 #include <string>
 
 namespace gomoku::net {
@@ -16,6 +17,11 @@ namespace gomoku::net {
                                    int x,
                                    int y,
                                    std::string& error);
+
+[[nodiscard]] bool applySnapshotPacket(GameSession& session,
+                                       std::size_t declared_move_count,
+                                       const std::string& encoded_moves,
+                                       std::string& error);
 
 } // namespace gomoku::net
 
