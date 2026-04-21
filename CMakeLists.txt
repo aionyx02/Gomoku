@@ -5,6 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "" FORCE)
+endif()
+
 include(FetchContent)
 
 FetchContent_Declare(ftxui
@@ -45,21 +49,23 @@ endif()
 
 enable_testing()
 
-add_executable(gomoku_regression_tests
-        tests/regression_tests.cpp
-        src/ai/ai_player.cpp
-        src/core/game_session.cpp
-        src/net/webConnect.cpp
-)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/regression_tests.cpp)
+    add_executable(gomoku_regression_tests
+            tests/regression_tests.cpp
+            src/ai/ai_player.cpp
+            src/core/game_session.cpp
+            src/net/webConnect.cpp
+    )
 
-target_include_directories(gomoku_regression_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(gomoku_regression_tests PRIVATE
-        GOMOKU_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-)
-target_link_libraries(gomoku_regression_tests PRIVATE gomoku_core)
+    target_include_directories(gomoku_regression_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(gomoku_regression_tests PRIVATE
+            GOMOKU_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    target_link_libraries(gomoku_regression_tests PRIVATE gomoku_core)
 
-if(WIN32)
-    target_link_libraries(gomoku_regression_tests PRIVATE ws2_32)
+    if(WIN32)
+        target_link_libraries(gomoku_regression_tests PRIVATE ws2_32)
+    endif()
+
+    add_test(NAME gomoku_regression_tests COMMAND gomoku_regression_tests)
 endif()
-
-add_test(NAME gomoku_regression_tests COMMAND gomoku_regression_tests)

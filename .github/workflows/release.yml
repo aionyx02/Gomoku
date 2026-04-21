@@ -1,0 +1,36 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $outDir = "Gomoku-$version"
+          New-Item -ItemType Directory -Path $outDir
+          Copy-Item "build\Release\Gomoku_Project.exe" "$outDir\"
+          Copy-Item -Recurse "assets" "$outDir\"
+          Compress-Archive -Path "$outDir\*" -DestinationPath "Gomoku-$version-windows.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Gomoku-${{ github.ref_name }}-windows.zip
+          generate_release_notes: true

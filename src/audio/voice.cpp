@@ -18,18 +18,26 @@
 #include <iostream>
 #include <string>
 
-namespace fs = std::filesystem;
-
-#ifdef GOMOKU_SOURCE_DIR
-constexpr auto kSourceDir = GOMOKU_SOURCE_DIR;
-#else
-constexpr const char* kSourceDir = ".";
+#ifdef _WIN32
+#include <windows.h>
 #endif
+
+namespace fs = std::filesystem;
 
 namespace {
 
+fs::path executableDir() {
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH];
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    return fs::path(buf).parent_path();
+#else
+    return fs::canonical("/proc/self/exe").parent_path();
+#endif
+}
+
 std::string assetPath(const char* filename) {
-    return (fs::path(kSourceDir) / "assets" / "audio" / filename).lexically_normal().string();
+    return (executableDir() / "assets" / "audio" / filename).lexically_normal().string();
 }
 
 } // namespace
