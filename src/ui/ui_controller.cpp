@@ -223,9 +223,7 @@ struct Controller::Impl {
         }
 
         if (remote_waiting_for_peer_) {
-            const std::string endpoint = network.localEndpoint().empty()
-                ? ("port " + remote_port_input_)
-                : network.localEndpoint();
+            const std::string endpoint = waitingEndpointSummary();
             remote_status_text_ = "Waiting for peer on " + endpoint;
             return;
         }
@@ -269,6 +267,122 @@ struct Controller::Impl {
         local_status_color_ = color;
     }
 
+    [[nodiscard]] gomoku::SessionRules currentUiRules() const {
+        int seconds = 20;
+        try {
+            seconds = std::stoi(settings_timer_seconds_str_);
+        } catch (...) {
+            seconds = 20;
+        }
+        if (seconds <= 0) {
+            seconds = 20;
+        }
+
+        return gomoku::SessionRules{
+            .undo_enabled = settings_undo_enabled,
+            .timer_enabled = settings_timer_enabled,
+            .timer_seconds = seconds,
+        };
+    }
+
+    void syncSettingsFromSession() {
+        const auto& rules = session.rules();
+        settings_undo_enabled = rules.undo_enabled;
+        settings_timer_enabled = rules.timer_enabled;
+        settings_timer_seconds_str_ = std::to_string(rules.timer_seconds);
+    }
+
+    [[nodiscard]] bool shouldRunTimer() const {
+        const auto& rules = session.rules();
+        if (!rules.timer_enabled || show_save_menu_ || session.status() != gomoku::GameStatus::PLAYING) {
+            return false;
+        }
+
+        if (remote_mode_) {
+            return !remote_waiting_for_peer_ && network.isConnected() && network.isLocalTurn();
+        }
+
+        return active_index == kPvpTab || active_index == kPveTab;
+    }
+
+    void syncTimerToSessionState() {
+        if (!shouldRunTimer()) {
+            stopTimer();
+            return;
+        }
+
+        if (!timer_stop_.load()) {
+            return;
+        }
+
+        startTimer();
+    }
+
+    [[nodiscard]] std::vector<std::string> shareableHostEndpoints() const {
+        auto endpoints = network.shareableEndpoints();
+        if (!endpoints.empty()) {
+            return endpoints;
+        }
+
+        const std::string endpoint = network.localEndpoint();
+        if (!endpoint.empty() &&
+            endpoint.find("0.0.0.0:") == std::string::npos &&
+            endpoint.find("[::]:") == std::string::npos) {
+            endpoints.push_back(endpoint);
+        }
+
+        if (endpoints.empty() && !remote_port_input_.empty()) {
+            endpoints.push_back("127.0.0.1:" + remote_port_input_);
+        }
+        return endpoints;
+    }
+
+    [[nodiscard]] std::string waitingEndpointSummary() const {
+        const auto endpoints = shareableHostEndpoints();
+        if (endpoints.empty()) {
+            return "port " + remote_port_input_;
+        }
+        if (endpoints.size() == 1) {
+            return endpoints.front();
+        }
+        return endpoints.front() + " +" + std::to_string(endpoints.size() - 1) + " more";
+    }
+
+    bool commitSetupChanges() {
+        const auto requested_rules = currentUiRules();
+        const auto previous_rules = session.rules();
+
+        if (!remote_mode_ || remote_waiting_for_peer_ || !network.isConnected()) {
+            session.setRules(requested_rules);
+            syncSettingsFromSession();
+            stopTimer();
+            syncTimerToSessionState();
+            return true;
+        }
+
+        if (requested_rules == previous_rules) {
+            syncSettingsFromSession();
+            syncTimerToSessionState();
+            return true;
+        }
+
+        if (!network.syncConfig(requested_rules)) {
+            syncSettingsFromSession();
+            setLocalStatus("Setup sync failed: " + network.lastError());
+            setStatusMsg("Setup sync failed", 2500);
+            return false;
+        }
+
+        clearLocalStatus();
+        session.setRules(requested_rules);
+        syncSettingsFromSession();
+        stopTimer();
+        syncTimerToSessionState();
+        updateRemoteStatus("Remote setup synchronized.");
+        setStatusMsg("Remote setup synchronized", 1500);
+        return true;
+    }
+
     void resetTimeoutState() {
         consecutive_timeouts_ = 0;
         stopTimer();
@@ -279,6 +393,7 @@ struct Controller::Impl {
         clearLocalStatus();
         resetTimeoutState();
         session.start(next_mode);
+        syncSettingsFromSession();
         centerCursor();
 
         if (next_mode == gomoku::SessionMode::PVE) {
@@ -287,9 +402,7 @@ struct Controller::Impl {
             active_index = kPvpTab;
         }
 
-        if (settings_timer_enabled) {
-            startTimer();
-        }
+        syncTimerToSessionState();
     }
 
     void backToMenu() {
@@ -298,6 +411,7 @@ struct Controller::Impl {
         shutdownRemoteSession();
         clearLocalStatus();
         session.reset();
+        syncSettingsFromSession();
         active_index = kMenuTab;
         current_x = 0;
         current_y = 0;
@@ -330,6 +444,8 @@ struct Controller::Impl {
             return false;
         }
 
+        session.setRules(currentUiRules());
+        syncSettingsFromSession();
         network.disconnect();
         session.start(gomoku::SessionMode::PVP);
         centerCursor();
@@ -363,6 +479,8 @@ struct Controller::Impl {
             return false;
         }
 
+        session.setRules(currentUiRules());
+        syncSettingsFromSession();
         network.disconnect();
         session.start(gomoku::SessionMode::PVP);
         centerCursor();
@@ -376,8 +494,10 @@ struct Controller::Impl {
         }
 
         updateRemoteStatus();
+        syncSettingsFromSession();
         syncCursorToSession();
         active_index = kPvpTab;
+        syncTimerToSessionState();
         handleNetworkTick();
         return true;
     }
@@ -389,8 +509,10 @@ struct Controller::Impl {
             if (network.waitForPeer(std::chrono::milliseconds{0})) {
                 remote_waiting_for_peer_ = false;
                 updateRemoteStatus();
+                syncSettingsFromSession();
                 syncCursorToSession();
                 active_index = kPvpTab;
+                syncTimerToSessionState();
                 changed = true;
             } else if (!network.lastError().empty()) {
                 updateRemoteStatus();
@@ -401,18 +523,30 @@ struct Controller::Impl {
         if (remote_mode_ && !remote_waiting_for_peer_ && network.isConnected()) {
             const auto previous_move_count = session.move_history().size();
             const auto previous_status = session.status();
+            const auto previous_rules = session.rules();
+            const auto previous_turn = session.board().getCurrentPlayer();
 
             if (const bool handled = network.pump(std::chrono::milliseconds{0}); handled ||
                                                                                  previous_move_count != session.move_history().size() ||
-                                                                                 previous_status != session.status()) {
+                                                                                 previous_status != session.status() ||
+                                                                                 previous_turn != session.board().getCurrentPlayer() ||
+                                                                                 previous_rules != session.rules()) {
+                if (previous_rules != session.rules()) {
+                    syncSettingsFromSession();
+                    clearLocalStatus();
+                    stopTimer();
+                    setStatusMsg("Remote setup updated", 1500);
+                }
                 syncCursorToSession();
                 updateRemoteStatus();
+                syncTimerToSessionState();
                 changed = true;
             } else if (!network.lastError().empty()) {
                 updateRemoteStatus();
                 changed = true;
             }
         } else if (remote_mode_ && !remote_waiting_for_peer_ && !network.isConnected() && !network.lastError().empty()) {
+            stopTimer();
             updateRemoteStatus();
             changed = true;
         }
@@ -421,6 +555,7 @@ struct Controller::Impl {
             if (session.status() != gomoku::GameStatus::PLAYING &&
                 active_index != kResultTab &&
                 active_index != kRemoteWaitTab) {
+                stopTimer();
                 active_index = kResultTab;
                 changed = true;
             }
@@ -428,6 +563,7 @@ struct Controller::Impl {
             if (session.status() == gomoku::GameStatus::PLAYING && active_index == kResultTab) {
                 active_index = kPvpTab;
                 syncCursorToSession();
+                syncTimerToSessionState();
                 changed = true;
             }
         }
@@ -469,9 +605,8 @@ struct Controller::Impl {
 
     void startTimer() {
         stopTimer();
-        int secs = 20;
-        try { secs = std::stoi(settings_timer_seconds_str_); } catch (...) {}
-        if (secs <= 0) secs = 20;
+        const int secs = session.rules().timer_seconds;
+        settings_timer_seconds_str_ = std::to_string(secs);
         timer_remaining_ = secs;
         timer_stop_.store(false);
         timer_thread_ = std::thread([this] {
@@ -488,10 +623,21 @@ struct Controller::Impl {
 
     void handleTimerTimeout(const bool has_ai) {
         if (session.status() != gomoku::GameStatus::PLAYING) return;
-        session.skipTurn();
+
+        if (remote_mode_) {
+            if (!network.requestSkipTurn()) {
+                updateRemoteStatus("Time limit sync failed: " + network.lastError());
+                syncTimerToSessionState();
+                return;
+            }
+            updateRemoteStatus();
+        } else {
+            session.skipTurn();
+        }
+
         ++consecutive_timeouts_;
 
-        if (has_ai && session.status() == gomoku::GameStatus::PLAYING) {
+        if (!remote_mode_ && has_ai && session.status() == gomoku::GameStatus::PLAYING) {
             runAiTurn();
         }
 
@@ -503,9 +649,7 @@ struct Controller::Impl {
             return;
         }
 
-        if (settings_timer_enabled && session.status() == gomoku::GameStatus::PLAYING) {
-            startTimer();
-        }
+        syncTimerToSessionState();
     }
 
     void enterReplay() {
@@ -740,9 +884,12 @@ struct Controller::Impl {
                     clearLocalStatus();
                     syncCursorToSession();
                     active_index = (session.mode() == gomoku::SessionMode::PVE) ? kPveTab : kPvpTab;
+                    syncSettingsFromSession();
                     if (session.status() != gomoku::GameStatus::PLAYING) {
                         result_selected_ = 0;
                         active_index = kResultTab;
+                    } else {
+                        syncTimerToSessionState();
                     }
                 } else {
                     setLocalStatus("Load failed: " + session.last_persistence_error());
@@ -756,8 +903,10 @@ struct Controller::Impl {
     }
 
     bool trySaveSessionWithFeedback() {
+        namespace fs = std::filesystem;
         if (const std::string save_path = session.serialize(); !save_path.empty()) {
             clearLocalStatus();
+            setLocalStatus("Saved " + fs::path(save_path).filename().string(), Color::Green);
             setStatusMsg("Game saved!", 1500);
             return true;
         }
@@ -953,8 +1102,7 @@ struct Controller::Impl {
         component->render_logic = [this] { return renderGrid(); };
         component->event_logic = [this, has_ai](const Event& event) {
             if (event == Event::Special("timer_tick")) {
-                if (settings_timer_enabled && !show_save_menu_ &&
-                    session.status() == gomoku::GameStatus::PLAYING) {
+                if (shouldRunTimer()) {
                     if (timer_remaining_ > 0) {
                         --timer_remaining_;
                     }
@@ -1009,6 +1157,7 @@ struct Controller::Impl {
                     }
                     syncCursorToSession();
                     updateRemoteStatus();
+                    syncTimerToSessionState();
                     if (session.status() == gomoku::GameStatus::PLAYING && active_index == kResultTab) {
                         active_index = kPvpTab;
                     }
@@ -1020,9 +1169,7 @@ struct Controller::Impl {
                 } else {
                     setStatusMsg("Move undone", 1000);
                     syncCursorToSession();
-                    if (settings_timer_enabled && session.status() == gomoku::GameStatus::PLAYING) {
-                        startTimer();
-                    }
+                    syncTimerToSessionState();
                 }
                 return true;
             }
@@ -1048,6 +1195,7 @@ struct Controller::Impl {
                 syncCursorToSession();
                 updateRemoteStatus();
                 tryMoveToResult();
+                syncTimerToSessionState();
                 return true;
             }
 
@@ -1063,9 +1211,7 @@ struct Controller::Impl {
             if (has_ai && session.status() == gomoku::GameStatus::PLAYING) {
                 runAiTurn();
             }
-            if (settings_timer_enabled && session.status() == gomoku::GameStatus::PLAYING) {
-                startTimer();
-            }
+            syncTimerToSessionState();
 
             return true;
         };
@@ -1115,6 +1261,9 @@ struct Controller::Impl {
             return element;
         };
         auto back_button = Button("Ok", [this] {
+            if (!commitSetupChanges()) {
+                return;
+            }
             if (pending_mode_.has_value()) {
                 const auto mode = *pending_mode_;
                 pending_mode_.reset();
@@ -1151,15 +1300,21 @@ struct Controller::Impl {
                 hbox({ timer_checkbox->Render(), timer_row }),
             });
 
-            const auto settings_box = vbox({
+            Elements settings_content = {
                 text("Briefing") | hcenter | bold | color(Color::Cyan),
                 separator(),
                 how_to_play,
                 separator(),
                 setup_box,
-                separator(),
-                back_button->Render()
-            }) | border | center;
+            };
+            if (!local_status_text_.empty()) {
+                settings_content.push_back(separator());
+                settings_content.push_back(text(local_status_text_) | color(local_status_color_) | hcenter);
+            }
+            settings_content.push_back(separator());
+            settings_content.push_back(back_button->Render());
+
+            const auto settings_box = vbox(std::move(settings_content)) | border | center;
 
             return dbox({ renderGrid(), settings_box | clear_under | center });
         });
@@ -1170,7 +1325,7 @@ struct Controller::Impl {
 
         component->render_logic = [this] {
             const std::vector<std::string> result_labels = {
-                "Back to menu", "Play again", "View Replay"
+                "Back to menu", "Play again", "Save Game", "View Replay"
             };
             Elements items;
             for (int i = 0; i < static_cast<int>(result_labels.size()); ++i) {
@@ -1190,6 +1345,10 @@ struct Controller::Impl {
                     color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_)) | hcenter);
                 box_content.push_back(separator());
             }
+            if (!local_status_text_.empty()) {
+                box_content.push_back(text(local_status_text_) | color(local_status_color_) | hcenter);
+                box_content.push_back(separator());
+            }
             box_content.push_back(vbox(std::move(items)));
             box_content.push_back(separator());
             box_content.push_back(text(" \u2191\u2193 Move  Enter Confirm ") | dim | hcenter);
@@ -1199,7 +1358,7 @@ struct Controller::Impl {
         };
 
         component->event_logic = [this](const Event& event) {
-            constexpr int kNumOptions = 3;
+            constexpr int kNumOptions = 4;
             if (event == Event::ArrowUp) {
                 result_selected_ = (result_selected_ - 1 + kNumOptions) % kNumOptions;
                 return true;
@@ -1221,6 +1380,8 @@ struct Controller::Impl {
                     } else {
                         startGame(session.mode());
                     }
+                } else if (result_selected_ == 2) {
+                    trySaveSessionWithFeedback();
                 } else {
                     enterReplay();
                 }
@@ -1305,6 +1466,14 @@ struct Controller::Impl {
     Component renderRemoteWaitPage() {
         auto cancel_button = Button("Cancel", [this] { backToMenu(); });
         auto component = Renderer(cancel_button, [cancel_button, this] {
+            Elements endpoint_lines;
+            for (const auto& endpoint : shareableHostEndpoints()) {
+                endpoint_lines.push_back(text(endpoint) | bold | hcenter);
+            }
+            if (endpoint_lines.empty()) {
+                endpoint_lines.push_back(text("port " + remote_port_input_) | bold | hcenter);
+            }
+
             return vbox({
                 text("Waiting For Remote Player") | hcenter | bold | color(Color::Cyan),
                 separator(),
@@ -1312,10 +1481,8 @@ struct Controller::Impl {
                     color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_)) |
                     hcenter,
                 separator(),
-                text("Share this address with the other player:") | hcenter,
-                text(network.localEndpoint().empty() ? ("port " + remote_port_input_) : network.localEndpoint()) |
-                    bold |
-                    hcenter,
+                text("Share one of these addresses with the other player:") | hcenter,
+                vbox(std::move(endpoint_lines)),
                 separator(),
                 cancel_button->Render() | hcenter,
                 text("Esc Cancel") | dim | hcenter
