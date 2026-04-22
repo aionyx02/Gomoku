@@ -1,4 +1,4 @@
-#include "ui_controller_internal.h"
+#include "../../include/gomoku/ui/ui_controller_internal.h"
 
 namespace UI::detail {
 using namespace ftxui;

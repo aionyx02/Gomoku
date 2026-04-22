@@ -1,8 +1,8 @@
 #ifndef GOMOKU_UI_CONTROLLER_INTERNAL_H
 #define GOMOKU_UI_CONTROLLER_INTERNAL_H
 
-#include "../../include/gomoku/net/webConnect.h"
-#include "../../include/gomoku/ui/ui_controller.h"
+#include "../net/webConnect.h"
+#include "ui_controller.h"
 
 #include "ftxui/component/component.hpp"
 #include "ftxui/component/component_base.hpp"
