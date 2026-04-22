@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*.*.*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -33,4 +36,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: Gomoku-${{ github.ref_name }}-windows.zip
-          generate_release_notes: true
