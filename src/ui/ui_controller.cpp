@@ -1,5 +1,6 @@
 #include "../../include/gomoku/ui/ui_controller.h"
 
+#include "../../include/gomoku/audio/voice.h"
 #include "../../include/gomoku/net/webConnect.h"
 
 #include "ftxui/component/component.hpp"
@@ -849,10 +850,32 @@ struct Controller::Impl {
     }
 
     void tryMoveToResult() {
-        if (session.status() != gomoku::GameStatus::PLAYING) {
-            result_selected_ = 0;
-            active_index = kResultTab;
+        const auto status = session.status();
+        if (status == gomoku::GameStatus::PLAYING) return;
+
+        // Determine if the local player won, lost, or drew
+        if (status != gomoku::GameStatus::DRAW) {
+            const auto winning_stone = (status == gomoku::GameStatus::BLACK_WIN)
+                ? gomoku::Stone::BLACK : gomoku::Stone::WHITE;
+
+            bool local_won;
+            if (remote_mode_) {
+                local_won = (winning_stone == network.localStone());
+            } else if (active_index == kPveTab) {
+                local_won = (winning_stone == gomoku::Stone::BLACK); // human is always BLACK in PvE
+            } else {
+                local_won = (winning_stone == gomoku::Stone::BLACK); // PvP: play from black's perspective
+            }
+
+            if (local_won) {
+                voice::victorySound();
+            } else {
+                voice::defeatSound();
+            }
         }
+
+        result_selected_ = 0;
+        active_index = kResultTab;
     }
 
     bool runAiTurn() {

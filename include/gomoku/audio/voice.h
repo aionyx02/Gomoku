@@ -28,6 +28,10 @@ public:
 
     static void placeStoneSound();
 
+    static void victorySound();
+
+    static void defeatSound();
+
     static void stopBackgroundMusic();
 private:
 };

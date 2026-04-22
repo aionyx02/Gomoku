@@ -99,6 +99,18 @@ void voice::placeStoneSound() {
     ma_engine_play_sound(&engine, place_stone_path.c_str(), nullptr);
 }
 
+void voice::victorySound() {
+    if (!g_isInitalized) return;
+    const auto path = assetPath("victory.mp3");
+    ma_engine_play_sound(&engine, path.c_str(), nullptr);
+}
+
+void voice::defeatSound() {
+    if (!g_isInitalized) return;
+    const auto path = assetPath("defeat.mp3");
+    ma_engine_play_sound(&engine, path.c_str(), nullptr);
+}
+
 void voice::stopBackgroundMusic() {
     if (!g_isInitalized || !g_hasBgm) return;
     ma_sound_stop(&g_bgm);
