@@ -37,7 +37,7 @@ void playStoneAudioIfEnabled(const bool play_audio) {
 
 [[nodiscard]] std::string makeAiStatusText(const SessionMode mode) {
     return mode == SessionMode::PVE
-        ? "AI: ready (C++ reward engine)"
+        ? "AI: ready"
         : "AI: disabled in PvP";
 }
 
@@ -112,10 +112,9 @@ bool GameSession::ai_move() {
     playStoneAudioIfEnabled(true);
     last_move_ = std::pair{x, y};
     move_history_.emplace_back(x, y);
-    ai_status_text_ = "AI(reward): move (" + std::to_string(x) + "," + std::to_string(y) + ")";
-
+    ai_status_text_ = "AI: (" + std::to_string(x) + "," + std::to_string(y) + ")";
     if (!diagnostic.empty()) {
-        ai_status_text_ += " | " + diagnostic;
+        ai_status_text_ += "  |  " + diagnostic;
     }
 
     return true;

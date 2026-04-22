@@ -1161,6 +1161,8 @@ struct Controller::Impl {
                 back_button->Render()
             }) | border | center;
 
+            if (previous_tab == kMenuTab && !pending_mode_.has_value())
+                return settings_box | center;
             return dbox({ renderGrid(), settings_box | clear_under | center });
         });
     }
@@ -1336,15 +1338,34 @@ struct Controller::Impl {
     [[nodiscard]] Element renderGrid() const {
         const auto& board = session.board();
 
-        // Top info bar: Mode (left) | Timer status (right); overridden by remote/local status
+        // When settings/result overlay is shown, renderGrid() is the background.
+        // Use src_tab to infer the game context instead of active_index.
+        const int src_tab = [&]() -> int {
+            if (active_index == kSetupTab) {
+                if (previous_tab != kMenuTab) return previous_tab;
+                if (pending_mode_.has_value())
+                    return (*pending_mode_ == gomoku::SessionMode::PVE) ? kPveTab : kPvpTab;
+                return kPvpTab;
+            }
+            if (active_index == kResultTab) {
+                if (remote_mode_) return kPvpTab;
+                return (session.mode() == gomoku::SessionMode::PVE) ? kPveTab : kPvpTab;
+            }
+            return active_index;
+        }();
+
+        // Top info bar: Mode (left) | Timer status (right)
         Element info_bar;
-        if (remote_mode_) {
-            info_bar = text(remote_status_text_) | hcenter |
-                       color(remoteStatusColor(network.isConnected(), remote_waiting_for_peer_));
-        } else if (!local_status_text_.empty()) {
+        if (!local_status_text_.empty()) {
             info_bar = text(local_status_text_) | hcenter | color(local_status_color_);
         } else {
-            const std::string mode_str = "Mode: " + std::string(active_index == kPveTab ? "PvE" : "PvP");
+            std::string mode_label;
+            if (remote_mode_) {
+                const auto ep = network.remoteEndpoint();
+                mode_label = ep.empty() ? "Remote" : "Remote(" + ep + ")";
+            } else if (src_tab == kPveTab) mode_label = "PvE (AI)";
+            else                           mode_label = "PvP";
+
             Element timer_status;
             if (!settings_timer_enabled) {
                 timer_status = text("Timer Off") | dim;
@@ -1356,21 +1377,45 @@ struct Controller::Impl {
                         color(urgent ? Color::Red : Color::Yellow)
                 });
             }
-            info_bar = hbox({ text(" " + mode_str), filler(), timer_status, text(" ") });
+            info_bar = hbox({ text(" Mode: " + mode_label), filler(), timer_status, text(" ") });
         }
 
-        // Current player bar
+        // Opponent bar: PvE shows AI side, Remote shows peer and sides
         const bool is_black_turn = board.getCurrentPlayer() == gomoku::Stone::BLACK;
-        auto player_bar = text(is_black_turn ? "Current player: Black" : "Current player: White") |
-                          bold | color(is_black_turn ? Color::Red : Color::White) | hcenter;
-
-        // AI status bar
-        auto ai_bar = text(session.ai_status_text()) | hcenter;
-        if (active_index == kPveTab) {
-            ai_bar |= session.ai_used_fallback() ? color(Color::Yellow) : color(Color::Green);
-        } else {
-            ai_bar |= dim;
+        Element opponent_bar = text("");
+        bool show_opponent_bar = false;
+        if (src_tab == kPveTab) {
+            show_opponent_bar = true;
+            opponent_bar = hbox({
+                text(" Opponent(AI): White") | bold | color(Color::White),
+                filler(),
+                text("You: Black ") | bold | color(Color::Red)
+            });
+        } else if (remote_mode_ && network.isConnected()) {
+            show_opponent_bar = true;
+            const auto local_stone = network.localStone();
+            const auto opp_stone = (local_stone == gomoku::Stone::BLACK)
+                ? gomoku::Stone::WHITE : gomoku::Stone::BLACK;
+            opponent_bar = hbox({
+                text(" Opponent: " + stoneText(opp_stone))
+                    | bold | color(opp_stone == gomoku::Stone::BLACK ? Color::Red : Color::White),
+                filler(),
+                text("You: " + stoneText(local_stone) + " ")
+                    | bold | color(local_stone == gomoku::Stone::BLACK ? Color::Red : Color::White)
+            });
         }
+
+        // Current player bar with You/AI/Opponent suffix
+        std::string player_suffix;
+        if (src_tab == kPveTab) {
+            player_suffix = is_black_turn ? " (You)" : " (AI)";
+        } else if (remote_mode_ && network.isConnected()) {
+            player_suffix = (board.getCurrentPlayer() == network.localStone())
+                ? " (You)" : " (Opponent)";
+        }
+        const std::string player_name = is_black_turn ? "Black" : "White";
+        auto player_bar = text("Current player: " + player_name + player_suffix)
+            | bold | color(is_black_turn ? Color::Red : Color::White) | hcenter;
 
         Elements rows;
         const int size = board.getSize();
@@ -1399,14 +1444,17 @@ struct Controller::Impl {
             rows.push_back(hbox(std::move(columns)));
         }
 
-        // Hint line: urgent timer > timed status message > default controls
+        // Hint line: urgent timer > remote error > timed status message > default controls
         // Use fixed width to prevent layout shift when content changes
         Element hint_line;
         std::string hint_text;
         bool hint_is_status = false;
-        
+
         if (settings_timer_enabled && timer_remaining_ > 0 && timer_remaining_ <= 3) {
             hint_text = "  Hurry up! You'll get skipped!  ";
+            hint_is_status = true;
+        } else if (remote_mode_ && !network.lastError().empty()) {
+            hint_text = "  " + network.lastError() + "  ";
             hint_is_status = true;
         } else {
             if (const auto msg = activeStatusMsg(); !msg.empty()) {
@@ -1449,16 +1497,31 @@ struct Controller::Impl {
                 text(" [L]Leave/Save ") | bold
             });
 
-        auto board_element = vbox({
-            info_bar,
-            player_bar,
-            ai_bar,
-            separator(),
-            vbox(std::move(rows)) | hcenter,
-            separator(),
-            hint_line,
-            bottom_bar
-        }) | border | center;
+        // AI output section (PvE only): split ai_status_text_ on '\n' → two lines
+        Elements ai_section;
+        if (src_tab == kPveTab) {
+            const std::string& ai_text = session.ai_status_text();
+            const auto nl = ai_text.find('\n');
+            const std::string ai_line1 = nl != std::string::npos ? ai_text.substr(0, nl) : ai_text;
+            const std::string ai_line2 = nl != std::string::npos ? ai_text.substr(nl + 1) : "";
+            ai_section.push_back(separator());
+            ai_section.push_back(text(ai_line1) | hcenter | color(Color::GrayDark));
+            if (!ai_line2.empty()) {
+                ai_section.push_back(text(ai_line2) | hcenter | color(Color::GrayDark));
+            }
+        }
+
+        Elements board_rows = { info_bar };
+        if (show_opponent_bar) board_rows.push_back(opponent_bar);
+        board_rows.push_back(player_bar);
+        board_rows.push_back(separator());
+        board_rows.push_back(vbox(std::move(rows)) | hcenter);
+        board_rows.push_back(separator());
+        board_rows.push_back(hint_line);
+        board_rows.push_back(bottom_bar);
+        for (auto& el : ai_section) board_rows.push_back(std::move(el));
+
+        auto board_element = vbox(std::move(board_rows)) | border | center;
 
         if (!show_save_menu_) {
             return board_element;

@@ -314,18 +314,17 @@ struct CandidateReward {
 
 [[nodiscard]] std::string describeReward(const CandidateReward& reward) {
     std::ostringstream stream;
-    stream << "reward=" << std::llround(reward.total)
-           << " attack=" << std::llround(reward.attack)
-           << " defend=" << std::llround(reward.defense)
-           << " center=" << std::llround(reward.center)
-           << " local=" << std::llround(reward.local);
-
+    stream << "R=" << std::llround(reward.total);
     if (reward.winning) {
-        stream << " | win";
+        stream << "  [WIN]";
     } else if (reward.blocks_win) {
-        stream << " | block";
+        stream << "  [BLK]";
     }
-
+    stream << "\n"
+           << "Atk=" << std::llround(reward.attack)
+           << "  Def=" << std::llround(reward.defense)
+           << "  Ctr=" << std::llround(reward.center)
+           << "  Loc=" << std::llround(reward.local);
     return stream.str();
 }
 
