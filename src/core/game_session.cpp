@@ -16,6 +16,29 @@ namespace {
 
 constexpr int kMinSerializedBoardSize = 1;
 constexpr int kMaxSerializedBoardSize = 255;
+constexpr int kMinTimerSeconds = 1;
+constexpr int kMaxTimerSeconds = 999;
+
+[[nodiscard]] SessionRules sanitizeRules(SessionRules rules) {
+    rules.timer_seconds = std::clamp(rules.timer_seconds, kMinTimerSeconds, kMaxTimerSeconds);
+    return rules;
+}
+
+[[nodiscard]] bool parseEnabledToken(const std::string& token, bool& value) {
+    if (token == "1" || token == "true" || token == "TRUE" || token == "on" || token == "ON") {
+        value = true;
+        return true;
+    }
+    if (token == "0" || token == "false" || token == "FALSE" || token == "off" || token == "OFF") {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool parseTimerSecondsValue(const int seconds) {
+    return seconds >= kMinTimerSeconds && seconds <= kMaxTimerSeconds;
+}
 
 void playStoneAudioIfEnabled(const bool play_audio) {
     if (play_audio) {
@@ -48,6 +71,7 @@ GameSession::GameSession(const int board_size,
     : board_size_(std::max(1, board_size)),
       board_(board_size_),
       saves_dir_(saves_dir.empty() ? "saves" : std::move(saves_dir)) {
+    rules_ = sanitizeRules(rules_);
     reset();
 }
 
@@ -149,6 +173,14 @@ const std::vector<std::pair<int, int>>& GameSession::move_history() const {
     return move_history_;
 }
 
+const SessionRules& GameSession::rules() const {
+    return rules_;
+}
+
+void GameSession::setRules(SessionRules rules) {
+    rules_ = sanitizeRules(std::move(rules));
+}
+
 const std::string& GameSession::saves_dir() const {
     return saves_dir_;
 }
@@ -201,6 +233,9 @@ std::string GameSession::serialize() const {
 
     f << "mode " << (mode_ == SessionMode::PVE ? "PVE" : "PVP") << "\n";
     f << "size " << board_size_ << "\n";
+    f << "undo " << (rules_.undo_enabled ? 1 : 0) << "\n";
+    f << "timer " << (rules_.timer_enabled ? 1 : 0) << "\n";
+    f << "timer_seconds " << rules_.timer_seconds << "\n";
     for (const auto& [x, y] : move_history_) {
         f << x << " " << y << "\n";
     }
@@ -268,10 +303,61 @@ bool GameSession::deserialize(const std::string& filepath) {
 
     Board parsed_board(parsed_size);
     std::vector<std::pair<int, int>> parsed_history;
+    SessionRules parsed_rules = rules_;
+    bool move_section_started = false;
 
     int line_number = 2;
     while (std::getline(f, line)) {
         ++line_number;
+
+        std::istringstream entry_line(line);
+        std::string entry_key;
+        if (!(entry_line >> entry_key)) {
+            last_persistence_error_ = "Invalid empty entry at line " + std::to_string(line_number) + ".";
+            return false;
+        }
+
+        if (!move_section_started && entry_key == "undo") {
+            std::string enabled_token;
+            if (!(entry_line >> enabled_token) || entry_line >> extra_token) {
+                last_persistence_error_ = "Invalid undo header in save file.";
+                return false;
+            }
+            if (!parseEnabledToken(enabled_token, parsed_rules.undo_enabled)) {
+                last_persistence_error_ = "Undo header must be 0 or 1.";
+                return false;
+            }
+            continue;
+        }
+
+        if (!move_section_started && entry_key == "timer") {
+            std::string enabled_token;
+            if (!(entry_line >> enabled_token) || entry_line >> extra_token) {
+                last_persistence_error_ = "Invalid timer header in save file.";
+                return false;
+            }
+            if (!parseEnabledToken(enabled_token, parsed_rules.timer_enabled)) {
+                last_persistence_error_ = "Timer header must be 0 or 1.";
+                return false;
+            }
+            continue;
+        }
+
+        if (!move_section_started && entry_key == "timer_seconds") {
+            int parsed_timer_seconds = 0;
+            if (!(entry_line >> parsed_timer_seconds) || entry_line >> extra_token) {
+                last_persistence_error_ = "Invalid timer_seconds header in save file.";
+                return false;
+            }
+            if (!parseTimerSecondsValue(parsed_timer_seconds)) {
+                last_persistence_error_ = "Timer seconds out of supported range: " + std::to_string(parsed_timer_seconds);
+                return false;
+            }
+            parsed_rules.timer_seconds = parsed_timer_seconds;
+            continue;
+        }
+
+        move_section_started = true;
 
         std::istringstream move_line(line);
         int x = 0;
@@ -303,6 +389,7 @@ bool GameSession::deserialize(const std::string& filepath) {
     last_move_ = move_history_.empty()
         ? std::nullopt
         : std::optional{move_history_.back()};
+    rules_ = sanitizeRules(parsed_rules);
     ai_used_fallback_ = false;
     ai_status_text_ = makeAiStatusText(mode_);
     return true;

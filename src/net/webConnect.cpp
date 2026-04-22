@@ -76,17 +76,99 @@ enum class WaitResult {
     return token;
 }
 
-// [[nodiscard]] std::string stoneToken(const Stone stone) {
-//     switch (stone) {
-//         case Stone::BLACK:
-//             return "BLACK";
-//         case Stone::WHITE:
-//             return "WHITE";
-//         case Stone::EMPTY:
-//         default:
-//             return "EMPTY";
-//     }
-// }
+[[nodiscard]] std::string stoneToken(const Stone stone) {
+    switch (stone) {
+        case Stone::BLACK:
+            return "BLACK";
+        case Stone::WHITE:
+            return "WHITE";
+        case Stone::EMPTY:
+        default:
+            return "EMPTY";
+    }
+}
+
+[[nodiscard]] bool parseEnabledToken(const std::string_view token, bool& value) {
+    if (token == "1" || token == "TRUE" || token == "ON") {
+        value = true;
+        return true;
+    }
+    if (token == "0" || token == "FALSE" || token == "OFF") {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool isValidTimerSeconds(const int seconds) {
+    return seconds >= 1 && seconds <= 999;
+}
+
+[[nodiscard]] bool isUnspecifiedAddress(const std::string_view host) {
+    return host.empty() || host == "0.0.0.0" || host == "::";
+}
+
+[[nodiscard]] std::string formatEndpoint(const std::string_view host, const std::string_view service) {
+    if (host.find(':') != std::string_view::npos) {
+        return "[" + std::string(host) + "]:" + std::string(service);
+    }
+    return std::string(host) + ":" + std::string(service);
+}
+
+void appendUniqueEndpoint(std::vector<std::string>& endpoints,
+                          const std::string_view host,
+                          const std::string_view service) {
+    if (isUnspecifiedAddress(host)) {
+        return;
+    }
+
+    const std::string endpoint = formatEndpoint(host, service);
+    if (std::find(endpoints.begin(), endpoints.end(), endpoint) == endpoints.end()) {
+        endpoints.push_back(endpoint);
+    }
+}
+
+[[nodiscard]] std::vector<std::string> collectShareableEndpoints(const std::string& bind_address,
+                                                                 const std::string& service) {
+    std::vector<std::string> endpoints;
+    if (!bind_address.empty() && !isUnspecifiedAddress(bind_address)) {
+        appendUniqueEndpoint(endpoints, bind_address, service);
+        return endpoints;
+    }
+
+    std::array<char, 256> hostname{};
+#ifdef _WIN32
+    const int hostname_rc = gethostname(hostname.data(), static_cast<int>(hostname.size()));
+#else
+    const int hostname_rc = gethostname(hostname.data(), hostname.size());
+#endif
+    if (hostname_rc == 0) {
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_ADDRCONFIG;
+
+        addrinfo* results = nullptr;
+        if (getaddrinfo(hostname.data(), service.c_str(), &hints, &results) == 0) {
+            for (const addrinfo* current = results; current != nullptr; current = current->ai_next) {
+                std::array<char, NI_MAXHOST> host{};
+                if (getnameinfo(current->ai_addr,
+                                static_cast<SocketLength>(current->ai_addrlen),
+                                host.data(),
+                                static_cast<SocketLength>(host.size()),
+                                nullptr,
+                                0,
+                                NI_NUMERICHOST) == 0) {
+                    appendUniqueEndpoint(endpoints, host.data(), service);
+                }
+            }
+            freeaddrinfo(results);
+        }
+    }
+
+    appendUniqueEndpoint(endpoints, "127.0.0.1", service);
+    return endpoints;
+}
 
 [[nodiscard]] std::optional<Stone> stoneFromToken(std::string token) {
     token = normalizeToken(std::move(token));
@@ -253,10 +335,10 @@ bool sendAll(const SocketHandle socket, const std::string_view payload, std::str
                     static_cast<SocketLength>(host.size()),
                     service.data(),
                     static_cast<SocketLength>(service.size()),
-                    NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+                     NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
         return {};
     }
-    return std::string(host.data()) + ":" + service.data();
+    return formatEndpoint(host.data(), service.data());
 }
 
 bool queryEndpoint(const SocketHandle socket, const bool local, std::string& out) {
@@ -291,6 +373,27 @@ bool queryEndpoint(const SocketHandle socket, const bool local, std::string& out
         stream << x << ',' << y;
         first = false;
     }
+    return stream.str();
+}
+
+[[nodiscard]] std::string buildHelloLine(const GameSession& session, const Stone host_stone) {
+    const auto& rules = session.rules();
+    std::ostringstream stream;
+    stream << "HELLO 2 "
+           << session.board().getSize() << ' '
+           << stoneToken(host_stone) << ' '
+           << (rules.undo_enabled ? 1 : 0) << ' '
+           << (rules.timer_enabled ? 1 : 0) << ' '
+           << rules.timer_seconds;
+    return stream.str();
+}
+
+[[nodiscard]] std::string buildConfigLine(const SessionRules& rules) {
+    std::ostringstream stream;
+    stream << "CONFIG "
+           << (rules.undo_enabled ? 1 : 0) << ' '
+           << (rules.timer_enabled ? 1 : 0) << ' '
+           << rules.timer_seconds;
     return stream.str();
 }
 
@@ -348,6 +451,7 @@ bool applySnapshot(GameSession& session,
     }
 
     GameSession staged(session.board().getSize(), session.saves_dir());
+    staged.setRules(session.rules());
     staged.start(SessionMode::PVP);
     for (const auto& [x, y] : parsed_moves) {
         if (!staged.human_move(x, y, false)) {
@@ -388,6 +492,27 @@ bool applySnapshotPacket(GameSession& session,
     return applySnapshot(session, declared_move_count, encoded_moves, error);
 }
 
+bool applyConfigPacket(GameSession& session,
+                       SessionRules rules,
+                       std::string& error) {
+    if (!isValidTimerSeconds(rules.timer_seconds)) {
+        error = "Timer seconds out of supported range: " + std::to_string(rules.timer_seconds);
+        return false;
+    }
+
+    session.setRules(std::move(rules));
+    return true;
+}
+
+bool applySkipPacket(GameSession& session,
+                     std::string& error) {
+    if (!session.skipTurn()) {
+        error = "Remote requested turn skip, but the session is not in a playable state.";
+        return false;
+    }
+    return true;
+}
+
 } // namespace net
 
 struct webConnect::Impl {
@@ -402,6 +527,7 @@ struct webConnect::Impl {
     std::string inbound_buffer;
     std::string local_endpoint;
     std::string remote_endpoint;
+    std::vector<std::string> shareable_endpoints;
     std::string last_error;
 
     bool sendLine(const std::string& line) {
@@ -429,7 +555,33 @@ struct webConnect::Impl {
                 last_error = "Malformed HELLO packet: " + raw_line;
                 return false;
             }
-            if (version != 1) {
+            SessionRules remote_rules = session.rules();
+            if (version == 2) {
+                std::string undo_token;
+                std::string timer_token;
+                int timer_seconds = 0;
+                if (!(stream >> undo_token >> timer_token >> timer_seconds)) {
+                    last_error = "Malformed HELLO packet: " + raw_line;
+                    return false;
+                }
+
+                bool undo_enabled = false;
+                bool timer_enabled = false;
+                undo_token = normalizeToken(std::move(undo_token));
+                timer_token = normalizeToken(std::move(timer_token));
+                if (!parseEnabledToken(undo_token, undo_enabled) ||
+                    !parseEnabledToken(timer_token, timer_enabled) ||
+                    !isValidTimerSeconds(timer_seconds)) {
+                    last_error = "HELLO packet specified invalid remote rules.";
+                    return false;
+                }
+
+                remote_rules = SessionRules{
+                    .undo_enabled = undo_enabled,
+                    .timer_enabled = timer_enabled,
+                    .timer_seconds = timer_seconds,
+                };
+            } else if (version != 1) {
                 last_error = "Unsupported protocol version: " + std::to_string(version);
                 return false;
             }
@@ -446,6 +598,7 @@ struct webConnect::Impl {
             }
 
             session.start(SessionMode::PVP);
+            session.setRules(remote_rules);
             remote_stone = *host_color;
             local_stone = (*host_color == Stone::BLACK) ? Stone::WHITE : Stone::BLACK;
             hello_received = true;
@@ -491,8 +644,52 @@ struct webConnect::Impl {
             return true;
         }
 
+        if (command == "SKIP") {
+            if (!handshake_complete) {
+                last_error = "Received SKIP before the handshake completed.";
+                return false;
+            }
+            if (!net::applySkipPacket(session, last_error)) {
+                return false;
+            }
+            last_error.clear();
+            return true;
+        }
+
         if (command == "RESET") {
             session.start(SessionMode::PVP);
+            last_error.clear();
+            return true;
+        }
+
+        if (command == "CONFIG") {
+            std::string undo_token;
+            std::string timer_token;
+            int timer_seconds = 0;
+            if (!(stream >> undo_token >> timer_token >> timer_seconds)) {
+                last_error = "Malformed CONFIG packet: " + raw_line;
+                return false;
+            }
+
+            bool undo_enabled = false;
+            bool timer_enabled = false;
+            undo_token = normalizeToken(std::move(undo_token));
+            timer_token = normalizeToken(std::move(timer_token));
+            if (!parseEnabledToken(undo_token, undo_enabled) ||
+                !parseEnabledToken(timer_token, timer_enabled)) {
+                last_error = "CONFIG packet specified invalid enabled flags.";
+                return false;
+            }
+
+            if (!net::applyConfigPacket(session,
+                                        SessionRules{
+                                            .undo_enabled = undo_enabled,
+                                            .timer_enabled = timer_enabled,
+                                            .timer_seconds = timer_seconds,
+                                        },
+                                        last_error)) {
+                return false;
+            }
             last_error.clear();
             return true;
         }
@@ -594,6 +791,7 @@ bool webConnect::openHost(const std::uint16_t port, const std::string& bind_addr
     impl_->inbound_buffer.clear();
     queryEndpoint(impl_->listener.native(), true, impl_->local_endpoint);
     impl_->remote_endpoint.clear();
+    impl_->shareable_endpoints = collectShareableEndpoints(bind_address, service);
     impl_->last_error.clear();
     return true;
 }
@@ -623,7 +821,7 @@ bool webConnect::waitForPeer(const std::optional<std::chrono::milliseconds> time
     impl_->remote_endpoint = endpointToString(reinterpret_cast<const sockaddr*>(&address), length);
     queryEndpoint(impl_->peer.native(), true, impl_->local_endpoint);
 
-    if (const std::string hello = "HELLO 1 " + std::to_string(session_->board().getSize()) + ' ' + "BLACK"; !impl_->sendLine(hello) || !syncSnapshot()) {
+    if (const std::string hello = buildHelloLine(*session_, Stone::BLACK); !impl_->sendLine(hello) || !syncSnapshot()) {
         disconnect();
         return false;
     }
@@ -761,6 +959,24 @@ bool webConnect::requestUndo() const {
     return true;
 }
 
+bool webConnect::requestSkipTurn() const {
+    if (!impl_->connected) {
+        impl_->last_error = "Cannot skip turn without an active peer.";
+        return false;
+    }
+    if (!session_->skipTurn()) {
+        impl_->last_error = "Local timeout skip was rejected by the game session.";
+        return false;
+    }
+    if (!impl_->sendLine("SKIP")) {
+        session_->skipTurn();
+        impl_->last_error = "Failed to send SKIP; local timeout was rolled back. " + impl_->last_error;
+        return false;
+    }
+    impl_->last_error.clear();
+    return true;
+}
+
 bool webConnect::requestReset() const {
     if (!impl_->connected) {
         impl_->last_error = "Cannot request reset without an active peer.";
@@ -772,6 +988,22 @@ bool webConnect::requestReset() const {
     session_->start(SessionMode::PVP);
     impl_->last_error.clear();
     return true;
+}
+
+bool webConnect::syncConfig(const SessionRules& rules) const {
+    if (!impl_->connected) {
+        impl_->last_error = "Cannot sync config without an active peer.";
+        return false;
+    }
+    if (!isValidTimerSeconds(rules.timer_seconds)) {
+        impl_->last_error = "Timer seconds must be between 1 and 999.";
+        return false;
+    }
+    const bool ok = impl_->sendLine(buildConfigLine(rules));
+    if (ok) {
+        impl_->last_error.clear();
+    }
+    return ok;
 }
 
 bool webConnect::syncSnapshot() const {
@@ -851,6 +1083,7 @@ void webConnect::disconnect() const {
     impl_->inbound_buffer.clear();
     impl_->local_endpoint.clear();
     impl_->remote_endpoint.clear();
+    impl_->shareable_endpoints.clear();
 }
 
 bool webConnect::isHosting() const noexcept {
@@ -879,6 +1112,10 @@ std::string webConnect::localEndpoint() const {
 
 std::string webConnect::remoteEndpoint() const {
     return impl_->remote_endpoint;
+}
+
+std::vector<std::string> webConnect::shareableEndpoints() const {
+    return impl_->shareable_endpoints;
 }
 
 const std::string& webConnect::lastError() const noexcept {

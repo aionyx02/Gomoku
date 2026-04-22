@@ -23,6 +23,13 @@ namespace gomoku::net {
                                        const std::string& encoded_moves,
                                        std::string& error);
 
+[[nodiscard]] bool applyConfigPacket(GameSession& session,
+                                     SessionRules rules,
+                                     std::string& error);
+
+[[nodiscard]] bool applySkipPacket(GameSession& session,
+                                   std::string& error);
+
 } // namespace gomoku::net
 
 #endif // GOMOKU_WEBCONNECT_PROTOCOL_H
