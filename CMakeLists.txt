@@ -23,6 +23,8 @@ add_executable(Gomoku_Project
         src/ai/ai_player.cpp
         src/core/game_session.cpp
         src/ui/ui_controller.cpp
+        src/ui/ui_controller_state.cpp
+        src/ui/ui_controller_views.cpp
         src/audio/voice.cpp
         src/net/webConnect.cpp
 )
