@@ -136,10 +136,7 @@ bool GameSession::ai_move() {
     playStoneAudioIfEnabled(true);
     last_move_ = std::pair{x, y};
     move_history_.emplace_back(x, y);
-    ai_status_text_ = "AI: (" + std::to_string(x) + "," + std::to_string(y) + ")";
-    if (!diagnostic.empty()) {
-        ai_status_text_ += "  |  " + diagnostic;
-    }
+    ai_status_text_ = diagnostic;
 
     return true;
 }
@@ -197,8 +194,6 @@ std::string GameSession::serialize() const {
 
     auto now = std::chrono::system_clock::now();
     auto t   = std::chrono::system_clock::to_time_t(now);
-    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) %
-                        std::chrono::seconds{1};
     std::tm tm_info{};
 #ifdef _WIN32
     localtime_s(&tm_info, &t);
@@ -206,8 +201,7 @@ std::string GameSession::serialize() const {
     localtime_r(&t, &tm_info);
 #endif
     std::ostringstream base_name;
-    base_name << "save_" << std::put_time(&tm_info, "%Y%m%d_%H%M%S")
-              << '_' << std::setw(3) << std::setfill('0') << millis.count();
+    base_name << std::put_time(&tm_info, "%Y%m%d_%H%M");
 
     fs::path filepath = fs::path(saves_dir_) / (base_name.str() + ".gomoku");
     for (int collision_index = 1;; ++collision_index) {
@@ -218,9 +212,7 @@ std::string GameSession::serialize() const {
             last_persistence_error_ = "Failed to check save file collision: " + filepath.string() + " (" + ec.message() + ")";
             return {};
         }
-        std::ostringstream collision_name;
-        collision_name << base_name.str() << '_' << collision_index << ".gomoku";
-        filepath = fs::path(saves_dir_) / collision_name.str();
+        filepath = fs::path(saves_dir_) / (base_name.str() + "_" + std::to_string(collision_index) + ".gomoku");
         ec.clear();
     }
 
@@ -230,11 +222,13 @@ std::string GameSession::serialize() const {
         return {};
     }
 
+    const bool finished = (board_.getStatus() != GameStatus::PLAYING);
     f << "mode " << (mode_ == SessionMode::PVE ? "PVE" : "PVP") << "\n";
     f << "size " << board_size_ << "\n";
     f << "undo " << (rules_.undo_enabled ? 1 : 0) << "\n";
     f << "timer " << (rules_.timer_enabled ? 1 : 0) << "\n";
     f << "timer_seconds " << rules_.timer_seconds << "\n";
+    f << "status " << (finished ? "FINISHED" : "PLAYING") << "\n";
     for (const auto& [x, y] : move_history_) {
         f << x << " " << y << "\n";
     }
@@ -342,6 +336,10 @@ bool GameSession::deserialize(const std::string& filepath) {
             continue;
         }
 
+        if (!move_section_started && entry_key == "status") {
+            continue;
+        }
+
         if (!move_section_started && entry_key == "timer_seconds") {
             int parsed_timer_seconds = 0;
             if (!(entry_line >> parsed_timer_seconds) || entry_line >> extra_token) {
@@ -392,6 +390,46 @@ bool GameSession::deserialize(const std::string& filepath) {
     ai_used_fallback_ = false;
     ai_status_text_ = makeAiStatusText(mode_);
     return true;
+}
+
+SaveFileInfo GameSession::peekSaveFile(const std::string& filepath) {
+    namespace fs = std::filesystem;
+    SaveFileInfo info;
+    info.path = filepath;
+    info.filename = fs::path(filepath).stem().string();
+    info.mode = "?";
+    info.status = "?";
+
+    std::ifstream f(filepath);
+    if (!f) {
+        return info;
+    }
+
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream ss(line);
+        std::string key;
+        if (!(ss >> key)) {
+            continue;
+        }
+        if (key == "mode") {
+            std::string val;
+            if (ss >> val) {
+                info.mode = (val == "PVE") ? "PvE" : "PvP";
+            }
+        } else if (key == "status") {
+            std::string val;
+            if (ss >> val) {
+                info.status = (val == "FINISHED") ? "Finished" : "Ongoing";
+            }
+        } else if (std::isdigit(static_cast<unsigned char>(key[0]))) {
+            break;
+        }
+        if (info.mode != "?" && info.status != "?") {
+            break;
+        }
+    }
+    return info;
 }
 
 const std::string& GameSession::last_persistence_error() const {

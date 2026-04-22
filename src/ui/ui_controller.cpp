@@ -6,9 +6,9 @@ using namespace ftxui;
 std::string gameResultText(const gomoku::GameStatus status) {
     switch (status) {
         case gomoku::GameStatus::BLACK_WIN:
-            return "Black win";
+            return "Black Win";
         case gomoku::GameStatus::WHITE_WIN:
-            return "White win";
+            return "White Win";
         case gomoku::GameStatus::DRAW:
             return "Draw";
         case gomoku::GameStatus::PLAYING:

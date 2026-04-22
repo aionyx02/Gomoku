@@ -17,6 +17,13 @@
 
 namespace gomoku {
 
+struct SaveFileInfo {
+    std::string path;
+    std::string filename;
+    std::string mode;   // "PvP" / "PvE"
+    std::string status; // "Finished" / "Ongoing" / "?"
+};
+
 enum class SessionMode : uint8_t {
     PVP = 0,
     PVE
@@ -57,6 +64,8 @@ public:
     // Returns the path to the saved file, or empty string on failure.
     std::string serialize() const;
     bool deserialize(const std::string& filepath);
+
+    static SaveFileInfo peekSaveFile(const std::string& filepath);
 
     [[nodiscard]] const std::string& saves_dir() const;
     [[nodiscard]] const std::string& last_persistence_error() const;

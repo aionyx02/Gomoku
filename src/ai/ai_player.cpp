@@ -314,17 +314,17 @@ struct CandidateReward {
 
 [[nodiscard]] std::string describeReward(const CandidateReward& reward) {
     std::ostringstream stream;
-    stream << "R=" << std::llround(reward.total);
+    stream << "AI model output:  Total-Reward=" << std::llround(reward.total);
     if (reward.winning) {
-        stream << "  [WIN]";
+        stream << "  (WIN)";
     } else if (reward.blocks_win) {
-        stream << "  [BLK]";
+        stream << "  (BLK)";
     }
     stream << "\n"
-           << "Atk=" << std::llround(reward.attack)
-           << "  Def=" << std::llround(reward.defense)
-           << "  Ctr=" << std::llround(reward.center)
-           << "  Loc=" << std::llround(reward.local);
+           << "  Atk=" << std::llround(reward.attack)
+           << "   Def=" << std::llround(reward.defense)
+           << "   Ctr=" << std::llround(reward.center)
+           << "   Loc=" << std::llround(reward.local);
     return stream.str();
 }
 

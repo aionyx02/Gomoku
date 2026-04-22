@@ -141,7 +141,7 @@ Component Controller::Impl::renderLoadGamePage() {
             separator()
         };
 
-        if (save_files_.empty()) {
+        if (save_file_infos_.empty()) {
             if (!load_directory_error_) {
                 content.push_back(text("No saves found in: " + session.saves_dir()) | dim | hcenter);
             }
@@ -154,24 +154,40 @@ Component Controller::Impl::renderLoadGamePage() {
             return vbox(std::move(content)) | border | center;
         }
 
-        Elements items;
-        for (int i = 0; i < static_cast<int>(save_files_.size()); ++i) {
-            namespace fs = std::filesystem;
-            auto label = fs::path(save_files_[i]).stem().string();
-            auto item = text("  " + label + "  ");
-            if (i == load_selected_) {
-                item |= inverted;
+        content.push_back(hbox({
+            text(" filename           ") | bold,
+            text("| mode ") | bold,
+            text("| status   ") | bold,
+        }));
+        content.push_back(separator());
+
+        for (int i = 0; i < static_cast<int>(save_file_infos_.size()); ++i) {
+            const auto& info = save_file_infos_[i];
+            constexpr int kFilenameWidth = 20;
+            std::string name = " " + info.filename;
+            if (static_cast<int>(name.size()) > kFilenameWidth) {
+                name = name.substr(0, kFilenameWidth - 1) + "~";
             }
-            items.push_back(item);
+            while (static_cast<int>(name.size()) < kFilenameWidth) {
+                name += ' ';
+            }
+            auto row = hbox({
+                text(name),
+                text("| " + info.mode + "  "),
+                text("| " + info.status + " "),
+            });
+            if (i == load_selected_) {
+                row |= inverted;
+            }
+            content.push_back(std::move(row));
         }
 
-        content.push_back(vbox(std::move(items)));
         if (!local_status_text_.empty()) {
             content.push_back(separator());
             content.push_back(text(local_status_text_) | color(local_status_color_) | hcenter);
         }
         content.push_back(separator());
-        content.push_back(text("Arrow keys Select  Enter Load  Esc Back") | dim | hcenter);
+        content.push_back(text("\u2191\u2193 Select  Enter Load  Esc Back") | dim | hcenter);
         return vbox(std::move(content)) | border | center;
     };
 
@@ -304,6 +320,14 @@ Component Controller::Impl::renderGameBoard(const bool has_ai) {
     auto component = std::make_shared<detail::InteractiveBoard>();
     component->render_logic = [this] { return renderGrid(); };
     component->event_logic = [this, has_ai](const Event& event) {
+        if (event == Event::Special("ai_move")) {
+            if (has_ai && session.status() == gomoku::GameStatus::PLAYING) {
+                runAiTurn();
+                syncTimerToSessionState();
+            }
+            return true;
+        }
+
         if (event == Event::Special("timer_tick")) {
             if (shouldRunTimer()) {
                 if (timer_remaining_ > 0) {
@@ -418,7 +442,7 @@ Component Controller::Impl::renderGameBoard(const bool has_ai) {
         stopTimer();
         tryMoveToResult();
         if (has_ai && session.status() == gomoku::GameStatus::PLAYING) {
-            runAiTurn();
+            startAiDelay();
         }
         syncTimerToSessionState();
 
@@ -460,7 +484,7 @@ Component Controller::Impl::renderSetupPage() {
 
     ButtonOption btn_opt;
     btn_opt.transform = [](const EntryState& state) {
-        auto element = text(state.label) | flex;
+        auto element = text(state.label) | hcenter | flex;
         if (state.focused) {
             element |= inverted;
         }
@@ -486,24 +510,24 @@ Component Controller::Impl::renderSetupPage() {
         auto timer_row = hbox({
             text("    "),
             timer_input->Render() | size(WIDTH, EQUAL, 4),
-            text(" sec")
+            text(" sec ")
         });
         if (!settings_timer_enabled) {
             timer_row = timer_row | dim;
         }
 
         const auto how_to_play = vbox({
-            text("\u2500\u2500 How to Play \u2500\u2500") | bold | color(Color::Cyan),
-            text("\u00b7 Get 5 in a row to win") | dim,
-            text("  (horizontal / vertical / diagonal)") | dim,
-            text("\u00b7 Black \u25cb goes first, alternate") | dim,
+            text("\u2500\u2500 How to Play \u2500\u2500") | bold | color(Color::Cyan) | hcenter,
+            text(" \u00b7 Get 5 in a row to win") | dim,
+            text("  (horizontal / vertical / diagonal) ") | dim,
+            text(" \u00b7 Black \u25cb goes first, alternate") | dim,
             text(""),
-            text("\u2191\u2193\u2190\u2192 Move   Enter/Space Place") | dim,
-            text("U Undo   S Setup   L Leave/Save") | dim,
+            text(" \u2191\u2193\u2190\u2192 to Move, Enter/Space to Place ") | dim,
+            text(" Press [S]/[U]/[L] for more options ") | dim,
         });
 
         const auto setup_box = vbox({
-            text("\u2500\u2500 Setup \u2500\u2500") | bold | color(Color::Cyan),
+            text("\u2500\u2500 Setup \u2500\u2500") | bold | color(Color::Cyan) | hcenter,
             undo_checkbox->Render(),
             hbox({timer_checkbox->Render(), timer_row}),
         });
@@ -520,7 +544,7 @@ Component Controller::Impl::renderSetupPage() {
             settings_content.push_back(text(local_status_text_) | color(local_status_color_) | hcenter);
         }
         settings_content.push_back(separator());
-        settings_content.push_back(back_button->Render());
+        settings_content.push_back(back_button->Render() | hcenter);
 
         const auto settings_box = vbox(std::move(settings_content)) | border | center;
         return dbox({renderGrid(), settings_box | clear_under | center});
@@ -560,18 +584,9 @@ Component Controller::Impl::renderEndPage() {
         Elements box_content = {
             text("Game Over") | hcenter | bold | color(Color::Red),
             separator(),
-            text("Result: " + detail::gameResultText(session.status())) | hcenter | color(Color::Cyan),
+            text("Result: " + detail::gameResultText(session.status())) | hcenter | bold | color(Color::Cyan),
             separator()
         };
-        if (remote_mode_) {
-            box_content.push_back(text(remote_status_text_) |
-                color(detail::remoteStatusColor(network.isConnected(), remote_waiting_for_peer_)) | hcenter);
-            box_content.push_back(separator());
-        }
-        if (!local_status_text_.empty()) {
-            box_content.push_back(text(local_status_text_) | color(local_status_color_) | hcenter);
-            box_content.push_back(separator());
-        }
         box_content.push_back(vbox(std::move(items)));
         box_content.push_back(separator());
         box_content.push_back(text(" \u2191\u2193 Move  Enter Confirm ") | dim | hcenter);
@@ -875,7 +890,7 @@ Element Controller::Impl::renderGrid() const {
         hint_text = "  " + msg + "  ";
         hint_is_status = true;
     } else {
-        hint_text = "\u2191\u2193\u2190\u2192 Move  |  [Enter]/[Space] Place   ";
+        hint_text = "\u2191\u2193\u2190\u2192 Move   [Enter]/[Space] Place";
     }
 
     if (constexpr int kHintLineWidth = 45; static_cast<int>(hint_text.length()) < kHintLineWidth) {
@@ -915,11 +930,10 @@ Element Controller::Impl::renderGrid() const {
         const auto newline = ai_text.find('\n');
         const std::string ai_line1 = newline != std::string::npos ? ai_text.substr(0, newline) : ai_text;
         const std::string ai_line2 = newline != std::string::npos ? ai_text.substr(newline + 1) : "";
-        const auto ai_color = session.ai_used_fallback() ? Color::Yellow : Color::Green;
         ai_section.push_back(separator());
-        ai_section.push_back(text(ai_line1) | hcenter | color(ai_color));
+        ai_section.push_back(text(ai_line1) | hcenter | dim);
         if (!ai_line2.empty()) {
-            ai_section.push_back(text(ai_line2) | hcenter | color(ai_color));
+            ai_section.push_back(text(ai_line2) | hcenter | dim);
         }
     }
 

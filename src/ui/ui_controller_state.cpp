@@ -194,6 +194,7 @@ void Controller::Impl::resetTimeoutState() {
 }
 
 void Controller::Impl::startGame(const gomoku::SessionMode next_mode) {
+    stopAiDelay();
     shutdownRemoteSession();
     clearLocalStatus();
     resetTimeoutState();
@@ -211,6 +212,7 @@ void Controller::Impl::startGame(const gomoku::SessionMode next_mode) {
 }
 
 void Controller::Impl::backToMenu() {
+    stopAiDelay();
     stopTimer();
     consecutive_timeouts_ = 0;
     shutdownRemoteSession();
@@ -401,6 +403,26 @@ void Controller::Impl::startReplayAuto() {
     });
 }
 
+void Controller::Impl::stopAiDelay() {
+    ai_delay_stop_.store(true);
+    if (ai_delay_thread_.joinable()) {
+        ai_delay_thread_.join();
+    }
+}
+
+void Controller::Impl::startAiDelay() {
+    stopAiDelay();
+    ai_delay_stop_.store(false);
+    ai_delay_thread_ = std::thread([this] {
+        for (int i = 0; i < 10 && !ai_delay_stop_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!ai_delay_stop_.load()) {
+            screen_state->screen.PostEvent(Event::Special("ai_move"));
+        }
+    });
+}
+
 void Controller::Impl::stopTimer() {
     timer_stop_.store(true);
     if (timer_thread_.joinable()) {
@@ -446,7 +468,7 @@ void Controller::Impl::handleTimerTimeout(const bool has_ai) {
     ++consecutive_timeouts_;
 
     if (!remote_mode_ && has_ai && session.status() == gomoku::GameStatus::PLAYING) {
-        runAiTurn();
+        startAiDelay();
     }
 
     if (consecutive_timeouts_ >= 3) {
@@ -471,6 +493,7 @@ void Controller::Impl::refreshSavesList() {
     namespace fs = std::filesystem;
 
     save_files_.clear();
+    save_file_infos_.clear();
     load_selected_ = 0;
     load_directory_error_ = false;
     clearLocalStatus();
@@ -512,15 +535,18 @@ void Controller::Impl::refreshSavesList() {
     }
 
     std::ranges::sort(save_files_, std::greater<>());
+
+    save_file_infos_.reserve(save_files_.size());
+    for (const auto& path : save_files_) {
+        save_file_infos_.push_back(gomoku::GameSession::peekSaveFile(path));
+    }
 }
 
 bool Controller::Impl::trySaveSessionWithFeedback() {
     namespace fs = std::filesystem;
 
     if (const std::string save_path = session.serialize(); !save_path.empty()) {
-        clearLocalStatus();
-        setLocalStatus("Saved " + fs::path(save_path).filename().string(), Color::Green);
-        setStatusMsg("Game saved!", 1500);
+        setStatusMsg("Saved " + fs::path(save_path).filename().string(), 2000);
         return true;
     }
 
