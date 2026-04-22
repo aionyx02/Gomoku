@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace gomoku {
 
@@ -33,7 +34,9 @@ public:
 
     bool sendLocalMove(int x, int y) const;
     bool requestUndo() const;
+    bool requestSkipTurn() const;
     bool requestReset() const;
+    bool syncConfig(const SessionRules& rules) const;
     bool syncSnapshot() const;
     bool pump(std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const;
 
@@ -46,6 +49,7 @@ public:
     [[nodiscard]] Stone remoteStone() const noexcept;
     [[nodiscard]] std::string localEndpoint() const;
     [[nodiscard]] std::string remoteEndpoint() const;
+    [[nodiscard]] std::vector<std::string> shareableEndpoints() const;
     [[nodiscard]] const std::string& lastError() const noexcept;
 
 private:

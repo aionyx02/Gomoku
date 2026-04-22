@@ -22,6 +22,14 @@ enum class SessionMode : uint8_t {
     PVE
 };
 
+struct SessionRules {
+    bool undo_enabled = true;
+    bool timer_enabled = false;
+    int timer_seconds = 20;
+
+    [[nodiscard]] bool operator==(const SessionRules& other) const = default;
+};
+
 class GameSession {
 public:
     explicit GameSession(int board_size = 15,
@@ -40,9 +48,11 @@ public:
     [[nodiscard]] bool ai_used_fallback() const;
     [[nodiscard]] std::optional<std::pair<int, int>> last_move() const;
     [[nodiscard]] const std::vector<std::pair<int, int>>& move_history() const;
+    [[nodiscard]] const SessionRules& rules() const;
 
     bool undo();
     bool skipTurn();
+    void setRules(SessionRules rules);
 
     // Returns the path to the saved file, or empty string on failure.
     std::string serialize() const;
@@ -60,6 +70,7 @@ private:
     bool ai_used_fallback_ = false;
     std::optional<std::pair<int, int>> last_move_;
     std::vector<std::pair<int, int>> move_history_;
+    SessionRules rules_;
     std::string saves_dir_;
     mutable std::string last_persistence_error_;
 };

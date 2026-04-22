@@ -2,6 +2,7 @@
 #include "gomoku/net/webConnect.h"
 #include "gomoku/net/webconnect_protocol.h"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -358,6 +359,65 @@ bool test_snapshot_packet_rejects_move_count_mismatch_without_mutating_state() {
                   "count-mismatch snapshot must preserve the existing last move");
 }
 
+bool test_snapshot_packet_preserves_session_rules() {
+    GameSession session(15);
+    session.start(SessionMode::PVP);
+    const gomoku::SessionRules expected_rules{
+        .undo_enabled = false,
+        .timer_enabled = true,
+        .timer_seconds = 45,
+    };
+    session.setRules(expected_rules);
+
+    std::string error;
+    if (!expect(gomoku::net::applySnapshotPacket(session, 2, "7,7;7,8", error),
+                "snapshot replay with valid moves should succeed")) {
+        return false;
+    }
+    if (!expect(error.empty(), "successful snapshot replay should not leave an error message")) {
+        return false;
+    }
+    return expect(session.rules() == expected_rules,
+                  "snapshot replay must preserve the synchronized session rules");
+}
+
+bool test_apply_config_packet_updates_session_rules() {
+    GameSession session(15);
+    session.start(SessionMode::PVP);
+
+    std::string error;
+    const gomoku::SessionRules expected_rules{
+        .undo_enabled = false,
+        .timer_enabled = true,
+        .timer_seconds = 30,
+    };
+    if (!expect(gomoku::net::applyConfigPacket(session, expected_rules, error),
+                "config packet should update the local session rules")) {
+        return false;
+    }
+    if (!expect(error.empty(), "config packet should not leave an error on success")) {
+        return false;
+    }
+    return expect(session.rules() == expected_rules,
+                  "config packet must overwrite the local session rules");
+}
+
+bool test_apply_skip_packet_switches_the_turn() {
+    GameSession session(15);
+    session.start(SessionMode::PVP);
+
+    std::string error;
+    if (!expect(gomoku::net::applySkipPacket(session, error),
+                "skip packet should advance the turn while the game is active")) {
+        return false;
+    }
+    if (!expect(error.empty(), "skip packet should not leave an error on success")) {
+        return false;
+    }
+    return expect(session.board().getCurrentPlayer() == Stone::WHITE,
+                  "skip packet should hand the turn to the other player");
+}
+
 bool test_connect_to_rejects_handshake_when_snapshot_is_invalid() {
     ScopedTestSocket listener;
     std::string setup_error;
@@ -399,6 +459,67 @@ bool test_connect_to_rejects_handshake_when_snapshot_is_invalid() {
                   "failed handshake should preserve snapshot validation error");
 }
 
+bool test_connect_to_applies_remote_rules_from_hello_v2() {
+    ScopedTestSocket listener;
+    std::string setup_error;
+    std::uint16_t port = 0;
+    if (!openLoopbackListener(listener, port, setup_error)) {
+        return expect(false, "failed to create loopback listener for HELLO v2 test: " + setup_error);
+    }
+
+    std::string server_error;
+    std::thread server([listener_socket = listener.release(), &server_error] {
+        ScopedTestSocket listener_owner(listener_socket);
+        sockaddr_in client_address{};
+        TestSocketLength client_length = sizeof(client_address);
+        ScopedTestSocket accepted(accept(listener_owner.get(),
+                                        reinterpret_cast<sockaddr*>(&client_address),
+                                        &client_length));
+        listener_owner.reset();
+        if (!accepted.valid()) {
+            server_error = "accept() failed: " + testSocketErrorString();
+            return;
+        }
+
+        const std::string payload = "HELLO 2 15 BLACK 0 1 45\nSNAPSHOT 0 -\n";
+        if (!sendAllForTest(accepted.get(), payload, server_error)) {
+            return;
+        }
+
+        std::array<char, 64> ready_buffer{};
+#ifdef _WIN32
+        const int received = recv(accepted.get(), ready_buffer.data(), static_cast<int>(ready_buffer.size()), 0);
+#else
+        const auto received = recv(accepted.get(), ready_buffer.data(), ready_buffer.size(), 0);
+#endif
+        if (received <= 0) {
+            server_error = "mock server failed to receive READY: " + testSocketErrorString();
+            return;
+        }
+    });
+
+    GameSession session(15);
+    webConnect connection(session);
+    const bool connected = connection.connectTo("127.0.0.1", port);
+    server.join();
+    connection.disconnect();
+
+    if (!expect(server_error.empty(), "mock server should complete the HELLO v2 exchange")) {
+        return false;
+    }
+    if (!expect(connected, "connectTo should accept a valid HELLO v2 handshake")) {
+        return false;
+    }
+    if (!expect(session.rules().undo_enabled == false, "HELLO v2 should synchronize undo setting")) {
+        return false;
+    }
+    if (!expect(session.rules().timer_enabled == true, "HELLO v2 should synchronize timer setting")) {
+        return false;
+    }
+    return expect(session.rules().timer_seconds == 45,
+                  "HELLO v2 should synchronize the timer duration");
+}
+
 bool test_serialize_reports_error_when_save_directory_is_invalid() {
     namespace fs = std::filesystem;
 
@@ -420,6 +541,39 @@ bool test_serialize_reports_error_when_save_directory_is_invalid() {
                   "serialize failure should preserve a descriptive persistence error");
 }
 
+bool test_serialize_and_deserialize_round_trip_rules() {
+    namespace fs = std::filesystem;
+
+    const fs::path temp_dir = fs::temp_directory_path() / "gomoku_regression_tests" / "rules_round_trip";
+    fs::create_directories(temp_dir);
+
+    GameSession source(15, temp_dir.string());
+    source.start(SessionMode::PVP);
+    source.setRules(gomoku::SessionRules{
+        .undo_enabled = false,
+        .timer_enabled = true,
+        .timer_seconds = 35,
+    });
+    if (!expect(source.human_move(5, 5, false), "baseline move should succeed before serialization")) {
+        return false;
+    }
+
+    const std::string save_path = source.serialize();
+    if (!expect(!save_path.empty(), "serialize should produce a save file for round-trip testing")) {
+        return false;
+    }
+
+    GameSession restored(15, temp_dir.string());
+    if (!expect(restored.deserialize(save_path), "deserialize should restore a freshly serialized save")) {
+        return false;
+    }
+    if (!expect(restored.rules() == source.rules(), "deserialize should restore synchronized session rules")) {
+        return false;
+    }
+    return expect(restored.move_history() == source.move_history(),
+                  "deserialize should preserve the move history alongside session rules");
+}
+
 } // namespace
 
 int main() {
@@ -429,8 +583,13 @@ int main() {
     ok = test_deserialize_rejects_partial_replay_without_mutating_state() && ok;
     ok = test_snapshot_packet_rejects_partial_replay_without_mutating_state() && ok;
     ok = test_snapshot_packet_rejects_move_count_mismatch_without_mutating_state() && ok;
+    ok = test_snapshot_packet_preserves_session_rules() && ok;
+    ok = test_apply_config_packet_updates_session_rules() && ok;
+    ok = test_apply_skip_packet_switches_the_turn() && ok;
     ok = test_connect_to_rejects_handshake_when_snapshot_is_invalid() && ok;
+    ok = test_connect_to_applies_remote_rules_from_hello_v2() && ok;
     ok = test_serialize_reports_error_when_save_directory_is_invalid() && ok;
+    ok = test_serialize_and_deserialize_round_trip_rules() && ok;
 
     if (!ok) {
         return 1;
