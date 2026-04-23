@@ -18,10 +18,14 @@
            └── placeStoneVoice.mp3
    ```
 
-4. 直接執行 `Gomoku_Project.exe`
+4. 用 Windows Terminal 或 PowerShell 進入解壓縮資料夾，再執行：
+   ```powershell
+   .\Gomoku_Project.exe
+   ```
 
 > **注意**：`assets/` 資料夾必須和 `.exe` 放在同一層，否則音效不會播放。  
 > 不需要安裝任何額外套件（Visual C++ Redistributable 等）。
+> 請不要在 IDE Output/Run console 內執行，FTXUI 需要真正的互動式終端機，否則畫面可能會往下重複或跑版。
 
 ---
 

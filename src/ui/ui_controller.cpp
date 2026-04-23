@@ -40,9 +40,9 @@ Element framedStoneCell(const std::string& symbol, const Color symbol_color) {
 Element stoneCellElement(const gomoku::Stone stone) {
     switch (stone) {
         case gomoku::Stone::WHITE:
-            return framedStoneCell("●", Color::White);
+            return framedStoneCell("W", Color::White);
         case gomoku::Stone::BLACK:
-            return framedStoneCell("○", Color::Red);
+            return framedStoneCell("B", Color::Red);
         case gomoku::Stone::EMPTY:
         default:
             return text(" + ") | color(Color::GrayDark) | size(WIDTH, EQUAL, 3) | hcenter;

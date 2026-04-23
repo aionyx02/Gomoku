@@ -517,17 +517,17 @@ Component Controller::Impl::renderSetupPage() {
         }
 
         const auto how_to_play = vbox({
-            text("\u2500\u2500 How to Play \u2500\u2500") | bold | color(Color::Cyan) | hcenter,
-            text(" \u00b7 Get 5 in a row to win") | dim,
+            text("-- How to Play --") | bold | color(Color::Cyan) | hcenter,
+            text(" - Get 5 in a row to win") | dim,
             text("  (horizontal / vertical / diagonal) ") | dim,
-            text(" \u00b7 Black \u25cb goes first, alternate") | dim,
+            text(" - Black B goes first, alternate") | dim,
             text(""),
-            text(" \u2191\u2193\u2190\u2192 to Move, Enter/Space to Place ") | dim,
+            text(" Arrow keys to Move, Enter/Space to Place ") | dim,
             text(" Press [S]/[U]/[L] for more options ") | dim,
         });
 
         const auto setup_box = vbox({
-            text("\u2500\u2500 Setup \u2500\u2500") | bold | color(Color::Cyan) | hcenter,
+            text("-- Setup --") | bold | color(Color::Cyan) | hcenter,
             undo_checkbox->Render(),
             hbox({timer_checkbox->Render(), timer_row}),
         });
@@ -589,7 +589,7 @@ Component Controller::Impl::renderEndPage() {
         };
         box_content.push_back(vbox(std::move(items)));
         box_content.push_back(separator());
-        box_content.push_back(text(" \u2191\u2193 Move  Enter Confirm ") | dim | hcenter);
+        box_content.push_back(text(" Up/Down Move  Enter Confirm ") | dim | hcenter);
 
         const auto result_box = vbox(std::move(box_content)) | border | center;
         return dbox({renderGrid(), result_box | clear_under | center});
@@ -890,7 +890,7 @@ Element Controller::Impl::renderGrid() const {
         hint_text = "  " + msg + "  ";
         hint_is_status = true;
     } else {
-        hint_text = "\u2191\u2193\u2190\u2192 Move   [Enter]/[Space] Place";
+        hint_text = "Arrow keys Move   [Enter]/[Space] Place";
     }
 
     if (constexpr int kHintLineWidth = 45; static_cast<int>(hint_text.length()) < kHintLineWidth) {
@@ -978,7 +978,7 @@ Element Controller::Impl::renderGrid() const {
         separator(),
         vbox(std::move(menu_items)),
         separator(),
-        text(" \u2191\u2193 Move  Enter Confirm ") | dim | hcenter
+        text(" Up/Down Move  Enter Confirm ") | dim | hcenter
     }) | border | bgcolor(Color::Black) | center;
 
     return dbox({board_element, overlay | clear_under | center});
