@@ -123,6 +123,8 @@ A successful build ends with a line like:
 
 The terminal UI will launch. Use arrow keys to navigate.
 
+> Use Windows Terminal or PowerShell with a monospace font. Do not run the game inside an IDE output console, because FTXUI needs a real interactive terminal; IDE consoles can make the screen repeat downward or appear misaligned. A terminal size of at least 80x30 is recommended.
+
 ### Step 8 — (Optional) Run Regression Tests
 
 ```powershell
@@ -414,6 +416,8 @@ cmake --build cmake-build-debug --target Gomoku_Project
 ```
 
 終端機 UI 啟動後，使用方向鍵操作。
+
+> 請用 Windows Terminal 或 PowerShell 搭配等寬字型執行。不要在 IDE 的 Output/Run console 內直接跑，因為 FTXUI 需要真正的互動式終端機；IDE console 可能會讓畫面一直往下重複或看起來跑版。建議終端機大小至少 80x30。
 
 #### 步驟八 — （選用）執行回歸測試
 
