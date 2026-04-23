@@ -520,7 +520,7 @@ Component Controller::Impl::renderSetupPage() {
             text("\u2500\u2500 How to Play \u2500\u2500") | bold | color(Color::Cyan) | hcenter,
             text(" \u00b7 Get 5 in a row to win") | dim,
             text("  (horizontal / vertical / diagonal) ") | dim,
-            text(" \u00b7 Black \u25cb goes first, alternate") | dim,
+            text(" \u00b7 Black X goes first, alternate") | dim,
             text(""),
             text(" \u2191\u2193\u2190\u2192 to Move, Enter/Space to Place ") | dim,
             text(" Press [S]/[U]/[L] for more options ") | dim,
