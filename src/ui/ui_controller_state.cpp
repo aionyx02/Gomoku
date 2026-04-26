@@ -492,7 +492,6 @@ void Controller::Impl::enterReplay() {
 void Controller::Impl::refreshSavesList() {
     namespace fs = std::filesystem;
 
-    save_files_.clear();
     save_file_infos_.clear();
     load_selected_ = 0;
     load_directory_error_ = false;
@@ -522,22 +521,22 @@ void Controller::Impl::refreshSavesList() {
         return;
     }
 
+    std::vector<std::string> save_files;
     for (fs::directory_iterator it(saves_path, ec), end; !ec && it != end; it.increment(ec)) {
         if (const auto& entry = *it; entry.path().extension() == ".gomoku") {
-            save_files_.push_back(entry.path().string());
+            save_files.push_back(entry.path().string());
         }
     }
     if (ec) {
-        save_files_.clear();
         load_directory_error_ = true;
         setLocalStatus("Unable to read save directory: " + saves_path.string() + " (" + ec.message() + ")");
         return;
     }
 
-    std::ranges::sort(save_files_, std::greater<>());
+    std::ranges::sort(save_files, std::greater<>());
 
-    save_file_infos_.reserve(save_files_.size());
-    for (const auto& path : save_files_) {
+    save_file_infos_.reserve(save_files.size());
+    for (const auto& path : save_files) {
         save_file_infos_.push_back(gomoku::GameSession::peekSaveFile(path));
     }
 }

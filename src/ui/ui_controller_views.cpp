@@ -198,22 +198,22 @@ Component Controller::Impl::renderLoadGamePage() {
             return true;
         }
         if (event == Event::ArrowUp) {
-            if (!save_files_.empty()) {
+            if (!save_file_infos_.empty()) {
                 load_selected_ = std::max(0, load_selected_ - 1);
             }
             voice::menuMoveSound();
             return true;
         }
         if (event == Event::ArrowDown) {
-            if (!save_files_.empty()) {
-                load_selected_ = std::min(static_cast<int>(save_files_.size()) - 1, load_selected_ + 1);
+            if (!save_file_infos_.empty()) {
+                load_selected_ = std::min(static_cast<int>(save_file_infos_.size()) - 1, load_selected_ + 1);
             }
             voice::menuMoveSound();
             return true;
         }
-        if (event == Event::Return && !save_files_.empty()) {
+        if (event == Event::Return && !save_file_infos_.empty()) {
             voice::selectedSound();
-            if (session.deserialize(save_files_[load_selected_])) {
+            if (session.deserialize(save_file_infos_[load_selected_].path)) {
                 shutdownRemoteSession();
                 clearLocalStatus();
                 syncCursorToSession();

@@ -173,7 +173,6 @@ struct Controller::Impl {
     std::string status_msg_;
     std::chrono::steady_clock::time_point status_msg_until_{};
 
-    std::vector<std::string> save_files_;
     std::vector<gomoku::SaveFileInfo> save_file_infos_;
     int load_selected_ = 0;
 
